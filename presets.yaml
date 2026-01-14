@@ -1,0 +1,12 @@
+Generic_1TB:
+  heads: 2
+  lba_max: 1953525168
+  rpm: 7200
+  speed_in: 70.0
+  speed_out: 150.0
+WD40EFRX:
+  heads: 8
+  lba_max: 7814037168
+  rpm: 5400
+  speed_in: 80.0
+  speed_out: 175.0

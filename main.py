@@ -6,259 +6,240 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import os
+import yaml
+import re
 
-# --- 1. 页面配置 ---
-st.set_page_config(page_title="HDD Visualizer Final", layout="wide")
-st.title("💿 硬盘坏道物理映射工具")
+# --- 1. 常量与配置初始化 ---
+st.set_page_config(page_title="HDD Physical Diagnostic Pro", layout="wide")
 
-DATA_FILE = "bad_sectors.csv"
+PRESETS_FILE = "presets.yaml"
+DATA_FILE = "bad_sectors_v3.csv"
 
-# --- 2. 文件 I/O ---
-def load_from_csv():
-    if not os.path.exists(DATA_FILE):
-        return """546699936-546716320|250ms|circle
-3000000000-3000500000|3s|circle
-100000-200000|1s
-7800000000|err"""
-    try:
-        df = pd.read_csv(DATA_FILE)
-        text_lines = []
-        for _, row in df.iterrows():
-            line = f"{row['range']}"
-            if pd.notna(row['tag']) and str(row['tag']).strip() != '':
-                line += f"|{row['tag']}"
-            if 'count' in row and pd.notna(row['count']) and str(row['count']).strip() != '':
-                line += f"|{row['count']}"
-            text_lines.append(line)
-        return "\n".join(text_lines)
-    except:
-        return ""
+# Victoria 风格颜色映射
+COLOR_MAP = {
+    'gray': '#D3D3D3',   # 正常 (Normal)
+    'green': '#7FFF00',  # 黄绿色 (Victoria < 200ms 等级)
+    'orange': '#FFA500', # 橙色
+    'red': '#FF4500',    # 红色
+    'blue': '#4169E1',   # 错误 (UNCR/Error)
+    'black': '#000000'   # 物理损坏
+}
 
-def save_to_csv(text_input):
-    lines = text_input.strip().split('\n')
-    data_list = []
-    for line in lines:
-        line = line.strip()
-        if not line: continue
-        parts = line.split('|')
-        rng = parts[0].strip()
-        tag = parts[1].strip() if len(parts) > 1 else ''
-        cnt = parts[2].strip() if len(parts) > 2 else ''
-        data_list.append({'range': rng, 'tag': tag, 'count': cnt})
-    pd.DataFrame(data_list).to_csv(DATA_FILE, index=False)
-
-# --- 3. 侧边栏 ---
-with st.sidebar:
-    st.header("⚙️ 硬盘物理参数")
-    preset = st.selectbox("硬盘预设", ["WD 4TB (WD40EFRX)", "Seagate 2TB", "Custom"])
+# --- 2. 阈值逻辑函数 ---
+def victoria_grade(val, block_size):
+    """根据 BlockSize 和 响应/错误 判定等级"""
+    if isinstance(val, str): # 错误情况 (UNCR, AMNF 等)
+        return 'blue'
     
-    if preset == "WD 4TB (WD40EFRX)":
-        lba_max, rpm, spd_out, spd_in = 7814037168, 5400, 175.0, 80.0
-    elif preset == "Seagate 2TB":
-        lba_max, rpm, spd_out, spd_in = 3907029168, 7200, 210.0, 100.0
-    else:
-        lba_max = st.number_input("总 LBA", 7814037168)
-        rpm = st.number_input("RPM", 7200)
-        spd_out = st.number_input("外圈速度 MB/s", 180.0)
-        spd_in = st.number_input("内圈速度 MB/s", 80.0)
+    bs = int(block_size)
+    ms = float(val)
+    
+    # 阈值表映射
+    if bs <= 256: 
+        thresholds = [50, 200, 600]
+    elif bs == 512: 
+        thresholds = [100, 400, 1200]
+    elif bs == 1024: 
+        thresholds = [150, 600, 1800]
+    elif bs == 2048: 
+        thresholds = [250, 1000, 3000]
+    elif bs == 4096: 
+        thresholds = [450, 1800, 5400]
+    elif bs == 8192: 
+        thresholds = [850, 3400, 10000]
+    elif bs == 16384: 
+        thresholds = [1700, 6600, 19000]
+    elif bs == 32768: 
+        thresholds = [3300, 13000, 39000]
+    else: # 65535
+        thresholds = [6400, 25000, 76000]
 
-# --- 4. 核心计算逻辑 (点线分离) ---
-def calculate_geometry_and_map(rpm, s_out, s_in, total_lba, input_data):
-    # 物理计算
+    if ms < thresholds[0]: return 'gray'
+    if ms < thresholds[1]: return 'green'
+    if ms < thresholds[2]: return 'orange'
+    return 'red'
+
+# --- 3. 配置管理 ---
+def load_presets():
+    if not os.path.exists(PRESETS_FILE):
+        default = {
+            'WD40EFRX': {'lba_max': 7814037168, 'heads': 8, 'rpm': 5400, 'speed_out': 175.0, 'speed_in': 80.0},
+            'ST2000DM001': {'lba_max': 3907029168, 'heads': 6, 'rpm': 7200, 'speed_out': 210.0, 'speed_in': 100.0}
+        }
+        with open(PRESETS_FILE, 'w') as f: yaml.dump(default, f)
+        return default
+    with open(PRESETS_FILE, 'r') as f: return yaml.safe_load(f)
+
+# --- 4. 物理映射核心 ---
+def lba_to_chs(lba, heads, A, B, total_tracks):
+    H = heads
+    delta = (A*H)**2 - 2*(0.5*B*H)*lba
+    if delta < 0: delta = 0
+    cylinder = (A*H - np.sqrt(delta)) / (B*H) if B != 0 else lba/(A*H)
+    
+    current_spt = A - B * cylinder
+    lba_start_of_cylinder = H * (A*cylinder - 0.5*B*cylinder**2)
+    lba_in_cyl = lba - lba_start_of_cylinder
+    
+    head = int(lba_in_cyl // current_spt)
+    head = min(head, H - 1)
+    
+    sector_offset = lba_in_cyl % current_spt
+    theta = (sector_offset / current_spt) * 2 * np.pi
+    
+    norm_track = cylinder / total_tracks
+    return cylinder, head, theta, norm_track
+
+# --- 5. UI 侧边栏与配置 ---
+presets = load_presets()
+with st.sidebar:
+    st.header("🛠️ 硬盘规格预设")
+    model_name = st.selectbox("选择型号", list(presets.keys()) + ["Custom"])
+    
+    if model_name != "Custom":
+        p = presets[model_name]
+        lba_max = p['lba_max']; heads = p['heads']; rpm = p['rpm']; s_out = p['speed_out']; s_in = p['speed_in']
+    else:
+        lba_max = st.number_input("LBA Max", 7814037168)
+        heads = st.number_input("Heads", 8)
+        rpm = st.number_input("RPM", 5400)
+        s_out = st.number_input("Speed Out (MB/s)", 180.0)
+        s_in = st.number_input("Speed In (MB/s)", 80.0)
+
+    # 计算 ZBR
     rps = rpm / 60.0
     spt_out = (s_out * 1_000_000) / (512 * rps)
     spt_in = (s_in * 1_000_000) / (512 * rps)
-    avg_spt = (spt_out + spt_in) / 2
-    total_tracks = total_lba / avg_spt
-    
-    A = spt_out
-    B = (spt_out - spt_in) / total_tracks
-    
-    # 两个绘图列表：scatter 用于点，line 用于圆环/弧线
-    scatter_points = []
-    line_shapes = [] 
-    list_entries = []
-    
-    lines = input_data.strip().split('\n')
-    for line in lines:
-        line = line.strip()
-        if not line: continue
-        
-        parts = line.split('|')
-        rng_str = parts[0].strip()
-        tag = parts[1].strip().lower() if len(parts) > 1 else 'default'
-        user_param = parts[2].strip().lower() if len(parts) > 2 else None
-        
-        # 颜色映射
-        c = 'gray'
-        if '250ms' in tag: c = 'green'
-        elif '1s' in tag: c = 'orange'
-        elif '3s' in tag: c = 'red'
-        elif 'err' in tag: c = 'black'
+    total_tracks = lba_max / ((spt_out + spt_in)/2 * heads)
+    A, B = spt_out, (spt_out - spt_in) / total_tracks
+    r_in_ratio = spt_in / spt_out
 
-        try:
-            if '-' in rng_str:
-                s_lba, e_lba = map(int, rng_str.split('-'))
-                lba_mid = (s_lba + e_lba) // 2
-                range_len = e_lba - s_lba
-                is_range = True
-            else:
-                s_lba = e_lba = int(rng_str)
-                lba_mid = s_lba
-                range_len = 0
-                is_range = False
-        except:
-            continue
-            
-        # 计算半径 (基于中点)
-        delta = A**2 - 2 * B * lba_mid
-        if delta < 0: delta = 0
-        track_index = (A - np.sqrt(delta)) / B if B != 0 else lba_mid / A
+# --- 6. 数据录入逻辑 ---
+@st.dialog("Victoria Log 解析器")
+def log_importer():
+    st.write("解析 Victoria 日志并自动判定延迟等级")
+    bs_choice = st.selectbox("Block Size", [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65535], index=2)
+    log_text = st.text_area("粘贴 Log 行", height=200, placeholder="9:03:09 : Block start at 803429456 ... = 62 ms\n10:10:01 : Block start at 103655936 ... Read error: UNCR")
+    
+    if st.button("开始解析并追加"):
+        lines = log_text.split('\n')
+        new_entries = []
+        # Pattern 1: Time-based | Pattern 2: Error-based
+        p1 = r"Block start at (\d+) .* = (\d+) ms"
+        p2 = r"Block start at (\d+) .* Read error: (.*)"
         
-        current_spt = A - B * track_index
-        norm_track = track_index / total_tracks
-        if norm_track > 1.0: norm_track = 1.0
-        r_inner_ratio = spt_in / spt_out
-        radius = 1.0 - norm_track * (1.0 - r_inner_ratio)
+        for l in lines:
+            m1 = re.search(p1, l)
+            m2 = re.search(p2, l)
+            if m1:
+                lba_s = int(m1.group(1))
+                grade = victoria_grade(int(m1.group(2)), bs_choice)
+                new_entries.append(f"{lba_s}-{lba_s + bs_choice - 1}|{grade}")
+            elif m2:
+                lba_s = int(m2.group(1))
+                grade = victoria_grade("ERR", bs_choice) # 强制蓝紫色
+                new_entries.append(f"{lba_s}-{lba_s + bs_choice - 1}|{grade}")
+        
+        if new_entries:
+            st.session_state.raw_data += "\n" + "\n".join(new_entries)
+            st.rerun()
 
-        # === 绘图模式判定 ===
-        mode = "Point"
+# --- 7. 主界面 ---
+if 'raw_data' not in st.session_state: st.session_state.raw_data = ""
+
+c1, c2 = st.columns([4, 6])
+
+with c1:
+    st.subheader("📝 数据管理")
+    st.session_state.raw_data = st.text_area("LBA-Range|Grade|Points", value=st.session_state.raw_data, height=400)
+    
+    col_btns = st.columns(3)
+    with col_btns[0]:
+        if st.button("🪄 助手"): log_importer()
+    with col_btns[1]:
+        if st.button("🚀 渲染"): st.rerun()
+    with col_btns[2]:
+        # 导出 CSV
+        df_export = []
+        for line in st.session_state.raw_data.strip().split('\n'):
+            if '|' in line:
+                p = line.split('|')
+                df_export.append({'range': p[0], 'grade': p[1], 'pts': p[2] if len(p)>2 else ''})
+        if df_export:
+            csv = pd.DataFrame(df_export).to_csv(index=False).encode('utf-8')
+            st.download_button("💾 导出", csv, "export.csv", "text/csv")
+
+with c2:
+    st.subheader("💿 磁盘物理示意图")
+    mode = st.radio("显示模式", ["Surface Individual", "Merge All Surfaces"], horizontal=True)
+    
+    # 物理映射计算
+    plot_objects = []
+    for line in st.session_state.raw_data.strip().split('\n'):
+        if not line.strip() or '|' not in line: continue
+        pts = line.split('|')
+        rng = pts[0].strip()
+        grade = pts[1].strip().lower()
+        cnt_req = int(pts[2]) if len(pts)>2 and pts[2].isdigit() else 0
         
-        # 判定条件 1: 用户显式指定 'circle'
-        is_circle_cmd = (user_param == 'circle') #改为0
+        s_lba, e_lba = map(int, rng.split('-')) if '-' in rng else (int(rng), int(rng))
+        color = COLOR_MAP.get(grade, COLOR_MAP['gray'])
         
-        # 判定条件 2: 范围超过一圈，且用户没有指定具体的数字（如 |5）
-        is_auto_circle = (range_len >= current_spt) and (not (user_param and user_param.isdigit()))
-        
-        # 判定条件 3: 用户指定了具体的点数 (如 |5)
-        is_discrete_count = (user_param and user_param.isdigit())
-        
-        if is_circle_cmd or is_auto_circle:
-            # === 模式 A: 实线圆环 (Line Plot) ===
-            mode = "Solid Ring"
-            # 生成 0 到 2pi 的连续坐标
-            thetas = np.linspace(0, 2*np.pi, 200) # 200个点足够平滑
-            radii = np.full_like(thetas, radius) # 半径恒定
-            
-            line_shapes.append({
-                'theta': thetas,
-                'r': radii,
-                'color': c,
-                'lw': 2.0 # 线宽
-            })
-            
-        elif is_discrete_count:
-            # === 模式 B: 用户强制指定点数 (Scatter) ===
-            count = int(user_param)
-            mode = f"Discrete ({count} pts)"
-            
-            if count > 0:
-                lbas = np.linspace(s_lba, e_lba, count).astype(int)
-                for lba in lbas:
-                    offset = lba % current_spt
-                    theta = (offset / current_spt) * 2 * np.pi
-                    scatter_points.append({'theta': theta, 'r': radius, 'color': c, 'size': 30})
-                    
+        # 采样点逻辑
+        if s_lba == e_lba or cnt_req > 0:
+            num = max(1, cnt_req)
+            lbas = np.linspace(s_lba, e_lba, num)
+            for l in lbas:
+                _, h, th, r_norm = lba_to_chs(l, heads, A, B, total_tracks)
+                r_val = 1.0 - r_norm * (1.0 - r_in_ratio)
+                plot_objects.append({'type': 'pt', 'h': h, 'r': r_val, 'th': th, 'c': color})
         else:
-            # === 模式 C: 默认行为 (小范围弧线或单点) ===
-            if is_range:
-                mode = "Arc (Auto)"
-                # 默认画首尾两点示意范围，或者画一段小弧线
-                # 为了简单，这里用散点画首尾，中间连线太复杂涉及跨0度问题
-                lbas = [s_lba, e_lba]
-                for lba in lbas:
-                    offset = lba % current_spt
-                    theta = (offset / current_spt) * 2 * np.pi
-                    scatter_points.append({'theta': theta, 'r': radius, 'color': c, 'size': 20})
+            # 弧线逻辑：如果跨越磁头，需分段
+            _, h1, th1, r_n1 = lba_to_chs(s_lba, heads, A, B, total_tracks)
+            _, h2, th2, r_n2 = lba_to_chs(e_lba, heads, A, B, total_tracks)
+            r_val = 1.0 - r_n1 * (1.0 - r_in_ratio)
+            
+            if h1 == h2:
+                plot_objects.append({'type': 'arc', 'h': h1, 'r': r_val, 't1': th1, 't2': th2, 'c': color})
             else:
-                mode = "Single Point"
-                offset = s_lba % current_spt
-                theta = (offset / current_spt) * 2 * np.pi
-                scatter_points.append({'theta': theta, 'r': radius, 'color': c, 'size': 40})
+                # 跨磁头处理 (简单首尾弧 + 中间全圆)
+                plot_objects.append({'type': 'arc', 'h': h1, 'r': r_val, 't1': th1, 't2': 2*np.pi, 'c': color})
+                for mid_h in range(h1+1, h2):
+                    plot_objects.append({'type': 'arc', 'h': mid_h, 'r': r_val, 't1': 0, 't2': 2*np.pi, 'c': color})
+                plot_objects.append({'type': 'arc', 'h': h2, 'r': r_val, 't1': 0, 't2': th2, 'c': color})
 
-        list_entries.append({
-            'Range': rng_str,
-            'Tag': tag,
-            'Mode': mode,
-            'Radius': f"{radius:.3f}"
-        })
+    # 绘图渲染
+    if mode == "Merge All Surfaces":
+        fig, ax = plt.subplots(subplot_kw={'projection': 'polar'}, figsize=(6, 6))
+        fig.patch.set_alpha(0.0); ax.patch.set_alpha(0.0)
+        ax.set_theta_zero_location('N'); ax.set_theta_direction(-1)
+        # 只在盘面区域画辅助虚线
+        for rad in np.linspace(r_in_ratio, 1.0, 5):
+            ax.plot(np.linspace(0, 2*np.pi, 100), [rad]*100, color='gray', lw=0.5, ls='--', alpha=0.3)
+        ax.fill_between(np.linspace(0, 2*np.pi, 50), r_in_ratio, 1.0, color='gray', alpha=0.05)
         
-    return scatter_points, line_shapes, list_entries, r_inner_ratio
-
-# --- 5. UI 布局 ---
-if 'input_text' not in st.session_state:
-    st.session_state['input_text'] = load_from_csv()
-
-col_ctrl1, col_ctrl2 = st.columns([1, 6])
-with col_ctrl1:
-    if st.button("📂 重载 CSV"):
-        st.session_state['input_text'] = load_from_csv()
-        st.rerun()
-
-col_editor, col_result = st.columns([35, 65])
-
-with col_editor:
-    st.subheader("📝 数据录入")
-    st.markdown("""
-    **显示规则:**
-    1. `...|circle` : 强制显示为**实线圆环**。
-    2. `...|5` : 强制显示为 **5个离散点**。
-    3. 大范围默认显示为圆环。
-    """)
-    new_text = st.text_area("Input", value=st.session_state['input_text'], height=450, label_visibility="collapsed")
-    if new_text != st.session_state['input_text']:
-        st.session_state['input_text'] = new_text
-
-    if st.button("💾 保存并更新", type="primary", use_container_width=True):
-        save_to_csv(new_text)
-        st.rerun()
-
-with col_result:
-    scatter_data, line_data, list_data, r_in_ratio = calculate_geometry_and_map(
-        rpm, spd_out, spd_in, lba_max, st.session_state['input_text']
-    )
-    
-    st.subheader("📊 物理可视化")
-    sub_c1, sub_c2 = st.columns([4, 6])
-    
-    with sub_c1:
-        if list_data:
-            st.dataframe(pd.DataFrame(list_data), height=400, use_container_width=True, hide_index=True)
-
-    with sub_c2:
-        if scatter_data or line_data:
-            fig = plt.figure(figsize=(5, 5))
-            ax = fig.add_subplot(111, projection='polar')
-            ax.set_theta_zero_location('N') #type:ignore
-            ax.set_theta_direction(-1)      #type:ignore
-            
-            fig.patch.set_alpha(0.0)
-            ax.patch.set_alpha(0.0)
-            
-            # 背景
-            ax.fill_between(np.linspace(0, 2*np.pi, 100), r_in_ratio, 1, color='#808080', alpha=0.1)
-            ax.plot(np.linspace(0, 2*np.pi, 100), [1]*100, color='#666', lw=0.5)
-            ax.plot(np.linspace(0, 2*np.pi, 100), [r_in_ratio]*100, color='#666', lw=0.5)
-            
-            # --- 绘制实线圆环 ---
-            for line in line_data:
-                ax.plot(line['theta'], line['r'], color=line['color'], linewidth=line['lw'], alpha=0.8)
-            
-            # --- 绘制散点 ---
-            if scatter_data:
-                thetas = [d['theta'] for d in scatter_data]
-                radii = [d['r'] for d in scatter_data]
-                colors = [d['color'] for d in scatter_data]
-                sizes = [d['size'] for d in scatter_data]
-                ax.scatter(thetas, radii, c=colors, s=sizes, edgecolors='none', alpha=0.9)
-            
-            ax.set_yticklabels([])
-            ax.set_xticklabels([])
-            ax.grid(True, alpha=0.2)
-            ax.spines['polar'].set_visible(False)
-            
-            st.pyplot(fig, use_container_width=True)
-            st.caption(
-                f"内径/外径比: {r_in_ratio:.2f}\n"
-                "🟢<250ms 🟠1s 🔴3s ⚫Bad"
-            )
+        for p in plot_objects:
+            if p['type'] == 'pt': ax.scatter(p['th'], p['r'], c=p['c'], s=15, edgecolors='none')
+            else: ax.plot(np.linspace(p['t1'], p['t2'], 50), [p['r']]*50, color=p['c'], lw=1.5)
+        
+        ax.set_yticklabels([]); ax.set_xticklabels([])
+        st.pyplot(fig)
+    else:
+        # 分磁头平铺 (Individual Surfaces)
+        h_to_view = st.columns(4)
+        for i in range(int(heads)):
+            with h_to_view[i % 4]:
+                fig, ax = plt.subplots(subplot_kw={'projection': 'polar'}, figsize=(3, 3))
+                fig.patch.set_alpha(0.0); ax.set_theta_zero_location('N'); ax.set_theta_direction(-1)
+                ax.set_title(f"Head {i}", fontsize=8)
+                ax.fill_between(np.linspace(0, 2*np.pi, 50), r_in_ratio, 1.0, color='gray', alpha=0.05)
+                # 盘面虚线
+                ax.plot(np.linspace(0, 2*np.pi, 100), [r_in_ratio]*100, color='gray', lw=0.5, ls='--')
+                ax.plot(np.linspace(0, 2*np.pi, 100), [1.0]*100, color='gray', lw=0.5, ls='--')
+                
+                for p in plot_objects:
+                    if p['h'] == i:
+                        if p['type'] == 'pt': ax.scatter(p['th'], p['r'], c=p['c'], s=10)
+                        else: ax.plot(np.linspace(p['t1'], p['t2'], 30), [p['r']]*30, color=p['c'], lw=1)
+                ax.set_yticklabels([]); ax.set_xticklabels([])
+                st.pyplot(fig)
