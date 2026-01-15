@@ -10,22 +10,23 @@ import yaml
 import re
 
 # --- 1. 配置与全局常量 ---
-st.set_page_config(page_title="HDD Physical Diagnostic V4", layout="wide")
+st.set_page_config(page_title="HDD Physical Diagnostic V4.1", layout="wide")
 
 PRESETS_FILE = "presets.yaml"
-# 颜色映射 (Delay Level)
-COLOR_MAP = {
-    'level1': '#D3D3D3',   # Gray (Normal)
-    'level2': '#7FFF00',   # Green (Good)
-    'level3': '#FFA500',   # Orange (Warning)
-    'level4': '#FF4500',   # Red (Critical)
-    'error':  '#4169E1',   # Blue/Purple (Error)
-    'black':  '#000000'    # Bad
+
+# 等级定义/颜色映射 (Delay Level)
+DELAY_LEVELS = {
+    'L1':  {'label': 'L1 (Gray)',   'color': '#D3D3D3', 'desc': 'Slow'}, 
+    'L2':  {'label': 'L2 (Green)',  'color': '#32CD32', 'desc': 'Mid'},
+    'L3':  {'label': 'L3 (Orange)', 'color': '#FFA500', 'desc': 'Warning'},
+    'L4':  {'label': 'L4 (Red)',    'color': '#FF0000', 'desc': 'Critical'},
+    'ERR': {'label': 'ERR (Blue)',  'color': '#0000FF', 'desc': 'Read Error'},
+    'BAD': {'label': 'BAD (Black)', 'color': '#000000', 'desc': 'Damaged'}
 }
 
-# 延迟等级阈值表 (ms)
+# 延迟等级阈值表 (对应victoria不同检测blocksize的延迟阈值(ms))
 DELAY_THRESHOLDS = {
-    'small':  [50, 200, 600],       # 1-256
+    'small':  [50, 200, 600],       # 1/32/64/128/256
     512:      [100, 400, 1200],
     1024:     [150, 600, 1800],
     2048:     [250, 1000, 3000],
@@ -165,14 +166,14 @@ def save_presets(data):
     with open(PRESETS_FILE, 'w') as f: yaml.dump(data, f)
 
 def get_grade(ms_val, block_size_key):
-    """Victoria 等级判定"""
-    if isinstance(ms_val, str): return 'error' # Error text
+    """Victoria 等级判定 -> 返回 LEVELS 的 Key"""
+    if isinstance(ms_val, str): return 'ERR' # Error text treated as ERR
     
     thresholds = DELAY_THRESHOLDS.get(block_size_key, DELAY_THRESHOLDS[2048])
-    if ms_val < thresholds[0]: return 'level1'
-    if ms_val < thresholds[1]: return 'level2'
-    if ms_val < thresholds[2]: return 'level3'
-    return 'level4'
+    if ms_val < thresholds[0]: return 'L1'
+    if ms_val < thresholds[1]: return 'L2'
+    if ms_val < thresholds[2]: return 'L3'
+    return 'L4'
 
 # --- 5. UI: 侧边栏配置 ---
 presets = load_presets()
@@ -272,7 +273,7 @@ def log_helper():
                 added.append(f"{lba_s}-{lba_s + bs_int - 1}|{grade}")
             elif m2:
                 lba_s = int(m2.group(1))
-                grade = 'error'
+                grade = 'ERR'
                 added.append(f"{lba_s}-{lba_s + bs_int - 1}|{grade}")
         
         if added:
@@ -282,6 +283,7 @@ def log_helper():
 # --- 7. 主界面布局 ---
 col_main_ui, col_viz = st.columns([1, 1.8])
 
+# ================= 左侧：控制与图例 =================
 with col_main_ui:
     st.subheader("📝 数据录入")
     
@@ -302,20 +304,40 @@ with col_main_ui:
             csv_str = pd.DataFrame(export_data).to_csv(index=False).encode('utf-8')
             st.download_button("💾 导出CSV", csv_str, "hdd_scan.csv", "text/csv", use_container_width=True)
 
+    # 1. 新增功能：等级过滤器
+    # 默认全选，获取 LEVELS 的所有 key
+    all_levels = list(DELAY_LEVELS.keys())
+    selected_levels = st.multiselect(
+        "👁️ 视图过滤器 (显示特定等级)",
+        options=all_levels,
+        default=all_levels
+    )
+
     # 文本框
     st.session_state.raw_data = st.text_area("输入 (LBA范围|Level|点数)", 
                                              value=st.session_state.raw_data, 
-                                             height=500)
+                                             height=400)
     
     # 图例表
     st.markdown("---")
-    st.caption("Victoria 等级对照表 (Delay Levels)")
-    legend_data = {
-        "Level": ["Level 1 (Gray)", "Level 2 (Green)", "Level 3 (Orange)", "Level 4 (Red)", "Error (Blue)"],
-        "Description": ["Normal", "Good", "Warning", "Critical", "Read Error"],
-        "Color": [COLOR_MAP['level1'], COLOR_MAP['level2'], COLOR_MAP['level3'], COLOR_MAP['level4'], COLOR_MAP['error']]
-    }
-    st.dataframe(pd.DataFrame(legend_data), hide_index=True, use_container_width=True)
+    st.caption("颜色等级对照 (Victoria Delay Levels)")
+    cols = st.columns(len(DELAY_LEVELS))
+    for i, (k, v) in enumerate(DELAY_LEVELS.items()):
+        with cols[i]:
+            # HTML 圆点 + 文字居中
+            st.markdown(f"""
+                <div style='
+                    background-color:{v['color']};
+                    height:20px;
+                    width:20px;
+                    border-radius:50%;
+                    margin-bottom:5px;
+                    border: 1px solid #ccc;'>
+                </div>
+                """, unsafe_allow_html=True)
+            # 显示描述
+            st.caption(f"**{k}**")
+            st.caption(f"*{v['desc']}*")
 
 
 with col_viz:
@@ -334,13 +356,18 @@ with col_viz:
         if not line.strip() or '|' not in line: continue
         parts = line.split('|')
         rng = parts[0].strip()
-        lvl = parts[1].strip().lower()
+
+        lvl = parts[1].strip().upper()        
+        # 过滤：如果不在多选框中，直接跳过
+        if lvl not in selected_levels:
+            continue
+
         cnt = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
         
         if '-' in rng: s, e = map(int, rng.split('-'))
         else: s = e = int(rng)
         
-        color = COLOR_MAP.get(lvl, COLOR_MAP['level1'])
+        color = DELAY_LEVELS.get(lvl, DELAY_LEVELS['L1'])['color']
         
         # 逻辑：单点、指定点数或小范围画散点；大范围画弧线
         if s == e or cnt > 0:
@@ -382,7 +409,7 @@ with col_viz:
                         # h1 > h2 这种情况通常不会在同柱面发生(除非数据排序错)，
                         # 但如果是物理柱面一样计算出了误差，就按点画
                         pass
-                    
+
     # 绘图辅助函数
     def draw_background(ax, r_in):
         ax.set_theta_zero_location('N')
