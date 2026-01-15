@@ -15,13 +15,14 @@ st.set_page_config(page_title="HDD Physical Diagnostic Pro", layout="wide")
 PRESETS_FILE = "presets.yaml"
 DATA_FILE = "bad_sectors_v3.csv"
 
-# Victoria 风格颜色映射
+# Victoria 风格颜色映射 delay等级
 COLOR_MAP = {
-    'gray': '#D3D3D3',   # 正常 (Normal)
-    'green': '#7FFF00',  # 黄绿色 (Victoria < 200ms 等级)
-    'orange': '#FFA500', # 橙色
-    'red': '#FF4500',    # 红色
-    'blue': '#4169E1',   # 错误 (UNCR/Error)
+    # 增加一个浅灰：正常
+    'gray': '#D3D3D3',   # 灰色
+    'green': '#7FFF00',  # 黄绿色
+    'orange': '#FF4500', # 橙色
+    'red': "#FF1E00",    # 红色
+    'blue': "#3F20EB",   # 错误 (UNCR/Error)
     'black': '#000000'   # 物理损坏
 }
 
