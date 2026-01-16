@@ -1,10 +1,10 @@
 Generic_1TB:
-  heads: 2 # 磁头/碟片
-  lba_max: 1953525168 #扇面数
+  heads: 2
+  lba_max: 1953525168
   rpm: 7200
   speed_in: 70.0
   speed_out: 150.0
-WD40EFRX:
+WDC WD40EFRX-68WT0N0:
   heads: 8
   lba_max: 7814037168
   rpm: 5400

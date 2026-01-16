@@ -1,6 +1,3 @@
-#python -m venv venv --system-site-packages
-#python -m streamlit run main.py
-
 import streamlit as st
 import matplotlib.pyplot as plt
 import numpy as np
@@ -8,6 +5,7 @@ import pandas as pd
 import os
 import yaml
 import re
+from io import StringIO
 
 # --- 1. 配置与全局常量 ---
 st.set_page_config(page_title="HDD Physical Diagnostic V4.1", layout="wide")
@@ -26,7 +24,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-PRESETS_FILE = "presets.yaml"
+PRESETS_FILE = "hdd_presets.yaml"
 
 # 等级定义/颜色映射 (Delay Level)
 DELAY_LEVELS = {
@@ -56,6 +54,7 @@ if 'block_size_idx' not in st.session_state: st.session_state.block_size_idx = 3
 if 'view_mode' not in st.session_state: st.session_state.view_mode = "Merge All Surfaces"
 if 'raw_data' not in st.session_state: st.session_state.raw_data = ""
 if 'edit_mode' not in st.session_state: st.session_state.edit_mode = False
+if 'hdd_sn' not in st.session_state: st.session_state.hdd_sn = ""
 
 # --- 3. 核心物理计算 (修正版) ---
 
@@ -180,8 +179,8 @@ def save_presets(data):
     with open(PRESETS_FILE, 'w') as f: yaml.dump(data, f)
 
 def get_grade(ms_val, block_size_key):
-    """Victoria 等级判定 -> 返回 LEVELS 的 Key"""
-    if isinstance(ms_val, str): return 'ERR' # Error text treated as ERR
+    """ 判定等级返回 Key """
+    if isinstance(ms_val, str): return 'ERR'
     
     thresholds = DELAY_THRESHOLDS.get(block_size_key, DELAY_THRESHOLDS[2048])
     if ms_val < thresholds[0]: return 'L1'
@@ -193,7 +192,18 @@ def get_grade(ms_val, block_size_key):
 presets = load_presets()
 
 with st.sidebar:
-    st.header("🛠️ 硬盘配置")
+    st.title("⚙️ 硬盘参数")
+    
+    # 硬盘基本信息 (独立于 Preset 之外)
+    st.markdown("### 🏷️ 识别信息")
+    # 序列号输入 (绑定 session_state) 
+    st.session_state.hdd_sn = st.text_input("序列号 (S/N)", 
+                                                   value=st.session_state.hdd_sn,
+                                                   placeholder="如: WD-WCC1E1ARP1XX")
+    
+    st.divider()
+
+    st.markdown("### 🛠️ 物理规格")
     
     # 模式切换
     col_mode, col_edit_btn = st.columns([2, 1])
@@ -218,8 +228,10 @@ with st.sidebar:
     # 表单区域
     with st.container(border=True):
         st.caption("参数详情")
-        # 如果是编辑模式，允许修改 Key (Model Name)
-        new_model_name = st.text_input("型号名称", value=display_name, disabled=not st.session_state.edit_mode)
+        # 编辑模式，允许修改 Key (Model Name)；另，使用 pop 读取临时导入值，实现一次性自动填充
+        val_model = st.session_state.pop('tmp_imported_model', display_name)
+        new_model_name = st.text_input("型号名称", value=val_model, disabled=not st.session_state.edit_mode)
+        val_lba = st.session_state.pop('tmp_imported_lba', current_data['lba_max'])
         
         c_lba = st.number_input("LBA Max", value=current_data['lba_max'], disabled=not st.session_state.edit_mode)
         c_heads = st.number_input("磁头数 (Heads)", value=current_data['heads'], disabled=not st.session_state.edit_mode)
@@ -259,7 +271,7 @@ def log_helper():
     def_idx = st.session_state.block_size_idx
     selected_bs_str = st.selectbox("Block Size", bs_options, index=def_idx, key="bs_selector")
     
-    # 更新记忆
+    # 更新blocksize选项记忆
     new_idx = bs_options.index(selected_bs_str)
     if new_idx != st.session_state.block_size_idx:
         st.session_state.block_size_idx = new_idx
@@ -284,11 +296,11 @@ def log_helper():
                 lba_s = int(m1.group(1))
                 ms = int(m1.group(2))
                 grade = get_grade(ms, bs_key)
-                added.append(f"{lba_s}-{lba_s + bs_int - 1}|{grade}")
+                added.append(f"{lba_s}-{lba_s + bs_int - 1}|{grade}|0")
             elif m2:
                 lba_s = int(m2.group(1))
                 grade = 'ERR'
-                added.append(f"{lba_s}-{lba_s + bs_int - 1}|{grade}")
+                added.append(f"{lba_s}-{lba_s + bs_int - 1}|{grade}|0")
         
         if added:
             st.session_state.raw_data += ("\n" if st.session_state.raw_data else "") + "\n".join(added)
@@ -304,38 +316,81 @@ with col_main_ui:
     # 定义导入功能的 Dialog
     @st.dialog("📂 导入扫描数据")
     def import_helper():
-        st.markdown("上传此前导出的 `bad_sectors.csv` 或符合格式的 CSV 文件。")
+        st.markdown("上传带有元数据的 CSV 文件。")
         st.caption("必需列名: `range`, `level`")
         
         uploaded_file = st.file_uploader("选择 CSV 文件", type=["csv"])
         if uploaded_file is not None:
             try:
-                df = pd.read_csv(uploaded_file)
-                # 简单校验
-                if 'range' not in df.columns or 'level' not in df.columns:
-                    st.error("CSV 格式错误：缺少 'range' 或 'level' 列")
+                # 1. 读取文件内容为字符串以解析 Metadata
+                content = uploaded_file.getvalue().decode("utf-8").splitlines()
+                
+                if not content:
+                    st.error("文件为空")
+                    return
+                
+                # 2. 解析第一行 Metadata
+                # 格式: Model: ...; Capacity ... LBAs; SN: ...; FW: ...
+                header_line = content[0]
+                meta_pattern = r"Model: (.*); Capacity (\d+) LBAs; SN: (.*)"
+                match = re.search(meta_pattern, header_line)
+                
+                parsed_meta = {}
+                csv_start_line = 0
+                # 匹配 Model
+                if match:
+                    parsed_meta['model'] = match.group(1).strip()
+                    parsed_meta['lba'] = int(match.group(2))
+                    parsed_meta['sn'] = match.group(3).strip()
+                    csv_start_line = 1 # 跳过第一行
+                    st.success(f"识别到硬盘: {parsed_meta['model']} (SN: {parsed_meta['sn']})")
+                else:
+                    st.warning("未检测到标准元数据头，将作为普通 CSV 读取。")
+
+                # 3. 解析数据部分 (跳过第一行 Metadata)
+                # 将剩余内容重新组合供 pandas 读取
+                csv_body = "\n".join(content[csv_start_line:])
+                df = pd.read_csv(StringIO(csv_body))
+
+                # 校验
+                required_cols = ['range', 'level'] # count 可选
+                if not all(col in df.columns for col in required_cols):
+                    st.error(f"CSV 格式错误：缺少必要的列 {required_cols}")
                 else:
                     # 预览
                     st.dataframe(df.head(3), hide_index=True, use_container_width=True)
                     
                     new_lines = []
                     for _, row in df.iterrows():
-                        # 兼容性处理：如果 CSV 里没有点数，默认不填
-                        line_str = f"{row['range']}|{row['level']}"
-                        new_lines.append(line_str)
+                        rng = str(row['range'])
+                        lvl = str(row['level'])
+                        # 读取 count 列，如果没有则默认为 0
+                        cnt = row['count'] if 'count' in df.columns and pd.notna(row['count']) else 0
+                        
+                        # 格式: range|level|count
+                        new_lines.append(f"{rng}|{lvl}|{int(cnt)}")
+
                     new_data_str = "\n".join(new_lines)
 
-                    # 按钮布局：并排显示
                     col_overwrite, col_append = st.columns(2)
 
                     with col_overwrite:
-                        if st.button("🗑️ 覆盖当前数据", type="primary", use_container_width=True):
+                        if st.button("🗑️ 覆盖并应用参数", type="primary", use_container_width=True):
+                            # 更新数据
                             st.session_state.raw_data = new_data_str
+                            
+                            # 如果有元数据，强制更新当前设置
+                            if match:
+                                # 更新 SN
+                                st.session_state.hdd_sn = parsed_meta['sn']
+                                st.session_state.tmp_imported_lba = parsed_meta['lba']
+                                st.session_state.tmp_imported_model = parsed_meta['model']
+                                st.toast(f"参数已读取: model {parsed_meta['model']}, LBA {parsed_meta['lba']}.")
+                                
                             st.rerun()
                     
                     with col_append:
-                        if st.button("➕ 追加到末尾", use_container_width=True):
-                            # 如果当前已有数据，先换行再追加
+                        if st.button("➕ 仅追加数据", use_container_width=True):
                             if st.session_state.raw_data.strip():
                                 st.session_state.raw_data = st.session_state.raw_data.strip() + "\n" + new_data_str
                             else:
@@ -357,21 +412,41 @@ with col_main_ui:
     
     with c_btn3:
         # CSV 导出逻辑
-        export_data = []
+        export_list = []
         lines = st.session_state.raw_data.strip().split('\n')
         for line in lines:
             if not line.strip() or '|' not in line: continue
             p = line.split('|')
-            # 尝试清洗数据
+            # 清洗数据
             r_val = p[0].strip()
             l_val = p[1].strip()
-            # 统一导出为新版 Key (可选，或者保持原样)
-            # l_val = LEVELS.get(l_val, {}).get('label', l_val) 
-            export_data.append({'range': r_val, 'level': l_val})
+            # 获取点数，缺省为 0
+            c_val = int(p[2]) if len(p) > 2 and p[2].strip().isdigit() else 0
+
+            export_list.append({'range': r_val, 'level': l_val, 'count': c_val})
             
-        if export_data:
-            csv_str = pd.DataFrame(export_data).to_csv(index=False).encode('utf-8')
-            st.download_button("💾 导出CSV", csv_str, "bad_sectors.csv", "text/csv", use_container_width=True)
+        if export_list:
+            current_model_name = new_model_name if 'new_model_name' in locals() else selected_model
+            safe_model = re.sub(r'[\\/*?:"<>|]', '_', current_model_name).strip()
+            safe_sn = re.sub(r'[\\/*?:"<>|]', '_', st.session_state.hdd_sn).strip()
+            if not safe_sn: safe_sn = "NoSN"
+            
+            filename = f"BadSectors_{safe_model}_{safe_sn}.csv"
+            
+            # 文件内容
+            # Header: Model: ...; Capacity ...; SN: ...
+            header_str = f"Model: {current_model_name}; Capacity {int(c_lba)} LBAs; SN: {st.session_state.hdd_sn}\n"
+            
+            # CSV Body
+            df = pd.DataFrame(export_list)
+            csv_body = df.to_csv(index=False)
+            final_csv_content = header_str + csv_body
+            
+            st.download_button("💾 导出CSV", 
+                               final_csv_content, 
+                               filename, 
+                               "text/csv", 
+                               use_container_width=True)
         else:
             st.button("💾 导出CSV", disabled=True, use_container_width=True)
 
@@ -391,7 +466,7 @@ with col_main_ui:
                                              help="支持格式：\n100-200|L4\n5000|ERR")
     
     # 图例表
-    st.markdown("---")
+    #st.markdown("---")
     st.caption("颜色等级对照 (Victoria Delay Levels)")
     cols = st.columns(len(DELAY_LEVELS))
     for i, (k, v) in enumerate(DELAY_LEVELS.items()):
@@ -436,6 +511,7 @@ with col_viz:
     # 解析数据
     plot_items = []
     lines = st.session_state.raw_data.strip().split('\n')
+
     for line in lines:
         if not line.strip() or '|' not in line: continue
         parts = line.split('|')
@@ -463,7 +539,7 @@ with col_viz:
                 plot_items.append({'type': 'pt', 'h': h, 'r': r_vis, 'th': th, 'c': color})
         else:
             # 弧线模式 (Range Mode)
-            # 获取起点和终点的完整坐标，包括整数柱面索引 c1, c2
+            # 获取起点和终点的完整坐标、整数柱面索引 c1, c2
             c1, h1, th1, rn1 = lba_to_chs(s, c_heads, A, B, Total_Cyls)
             c2, h2, th2, rn2 = lba_to_chs(e, c_heads, A, B, Total_Cyls)            
             # 计算各自的可视化半径 (跨柱面时半径不同)
@@ -496,7 +572,6 @@ with col_viz:
             else:
                 # 起点 -> 该磁道末尾
                 plot_items.append({'type': 'arc', 'h': h1, 'r': r_vis1, 't1': th1, 't2': 2*np.pi, 'c': color})
-                #全部画一圈
                 if c2 - c1 == 1:
                     # 起点 -> 后续磁头
                     for mh in range(h1 + 1, c_heads):
@@ -504,6 +579,7 @@ with col_viz:
                     # 首磁头 -> 终点
                     for mh in range(0, h2):
                         plot_items.append({'type': 'arc', 'h': mh, 'r': r_vis2, 't1': 0, 't2': 2*np.pi, 'c': color})
+                #全部画一圈，注：【这里半径r用的是vis1
                 else:
                     for mh in range(0, c_heads):
                         plot_items.append({'type': 'arc', 'h': mh, 'r': r_vis1, 't1': 0, 't2': 2*np.pi, 'c': color})
@@ -529,7 +605,6 @@ with col_viz:
         for cap_pct in [0.25, 0.50, 0.75]:
             r_cap = capacity_percent_to_radius(cap_pct, A, B, Total_Cyls, r_in)
             ax.plot(np.linspace(0, 2*np.pi, 100), [r_cap]*100, color='#888', lw=0.5, ls=':')
-            # 标注
             ax.text(np.radians(45), r_cap, f"{int(cap_pct*100)}%", fontsize=6, color='#666')
 
         # 辅助线 a: 轴线 (仅在 Ring 内)
@@ -539,8 +614,7 @@ with col_viz:
     # 渲染
     if view_opt == "Merge All Surfaces":
         fig, ax = plt.subplots(subplot_kw={'projection': 'polar'}, figsize=(8, 8))
-        draw_background(ax, r_in_ratio)
-        
+        draw_background(ax, r_in_ratio) 
         for p in plot_items:
             if p['type'] == 'pt': 
                 ax.scatter(p['th'], p['r'], c=p['c'], s=20, edgecolors='none', alpha=0.9)
@@ -548,12 +622,10 @@ with col_viz:
                 # 处理跨0度
                 ts = np.linspace(p['t1'], p['t2'], 50)
                 ax.plot(ts, [p['r']]*50, color=p['c'], lw=2, alpha=0.9)
-        
         st.pyplot(fig)
 
     else: # Individual Surfaces
         total_rows: int = (c_heads + cols_per_row - 1) // cols_per_row #type: ignore
-
         for row in range(total_rows):
             cols = st.columns(cols_per_row)
             for i in range(cols_per_row):
@@ -565,8 +637,7 @@ with col_viz:
                         ax.set_title(f"Head {h_idx}", y=1.05)
                         
                         # 筛选数据
-                        h_items = [p for p in plot_items if p['h'] == h_idx]
-                        
+                        h_items = [p for p in plot_items if p['h'] == h_idx]                        
                         for p in h_items:
                             if p['type'] == 'pt': 
                                 ax.scatter(p['th'], p['r'], c=p['c'], s=15, edgecolors='none')
