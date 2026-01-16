@@ -1,7 +1,0 @@
-WD40EFRX:
-  capacity_tb: 4.0
-  lba_max: 7814037168 #扇面数
-  heads: 8 # 磁头/碟片
-  rpm: 5400
-  speed_out: 175.0
-  speed_in: 80.0

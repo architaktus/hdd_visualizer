@@ -12,11 +12,25 @@ import re
 # --- 1. 配置与全局常量 ---
 st.set_page_config(page_title="HDD Physical Diagnostic V4.1", layout="wide")
 
+# --- CSS 样式注入：解决 Padding 过大问题 ---
+st.markdown("""
+    <style>
+        /* 调整主内容区域的上下 Padding */
+        .block-container {
+            padding-top: 1rem !important;
+            padding-bottom: 2rem !important;
+        }
+        [data-testid="stHeader"] {
+            background-color: rgba(0,0,0,0);
+            }
+    </style>
+""", unsafe_allow_html=True)
+
 PRESETS_FILE = "presets.yaml"
 
 # 等级定义/颜色映射 (Delay Level)
 DELAY_LEVELS = {
-    'L1':  {'label': 'L1 (Gray)',   'color': '#D3D3D3', 'desc': 'Slow'}, 
+    'L1':  {'label': 'L1 (Gray)',   'color': "#929292", 'desc': 'Slow'}, 
     'L2':  {'label': 'L2 (Green)',  'color': '#32CD32', 'desc': 'Mid'},
     'L3':  {'label': 'L3 (Orange)', 'color': '#FFA500', 'desc': 'Warning'},
     'L4':  {'label': 'L4 (Red)',    'color': '#FF0000', 'desc': 'Critical'},
@@ -287,22 +301,79 @@ col_main_ui, col_viz = st.columns([1, 1.8])
 with col_main_ui:
     st.subheader("📝 数据录入")
     
+    # 定义导入功能的 Dialog
+    @st.dialog("📂 导入扫描数据")
+    def import_helper():
+        st.markdown("上传此前导出的 `bad_sectors.csv` 或符合格式的 CSV 文件。")
+        st.caption("必需列名: `range`, `level`")
+        
+        uploaded_file = st.file_uploader("选择 CSV 文件", type=["csv"])
+        if uploaded_file is not None:
+            try:
+                df = pd.read_csv(uploaded_file)
+                # 简单校验
+                if 'range' not in df.columns or 'level' not in df.columns:
+                    st.error("CSV 格式错误：缺少 'range' 或 'level' 列")
+                else:
+                    # 预览
+                    st.dataframe(df.head(3), hide_index=True, use_container_width=True)
+                    
+                    new_lines = []
+                    for _, row in df.iterrows():
+                        # 兼容性处理：如果 CSV 里没有点数，默认不填
+                        line_str = f"{row['range']}|{row['level']}"
+                        new_lines.append(line_str)
+                    new_data_str = "\n".join(new_lines)
+
+                    # 按钮布局：并排显示
+                    col_overwrite, col_append = st.columns(2)
+
+                    with col_overwrite:
+                        if st.button("🗑️ 覆盖当前数据", type="primary", use_container_width=True):
+                            st.session_state.raw_data = new_data_str
+                            st.rerun()
+                    
+                    with col_append:
+                        if st.button("➕ 追加到末尾", use_container_width=True):
+                            # 如果当前已有数据，先换行再追加
+                            if st.session_state.raw_data.strip():
+                                st.session_state.raw_data = st.session_state.raw_data.strip() + "\n" + new_data_str
+                            else:
+                                st.session_state.raw_data = new_data_str
+                            st.rerun()
+            except Exception as e:
+                st.error(f"读取失败: {e}")
+
     # 按钮组
-    c_btn1, c_btn2, c_btn3 = st.columns([1, 1, 1])
+    c_btn1, c_btn2, c_btn3, c_btn4 = st.columns([1, 1.1, 1.1, 1.1])
     with c_btn1: 
         if st.button("🪄 Log助手", use_container_width=True): log_helper()
-    with c_btn2: 
+
+    with c_btn2:
+        if st.button("📂 导入CSV", use_container_width=True): import_helper()
+
+    with c_btn4: 
         if st.button("🚀 更新图表", type="primary", use_container_width=True): pass # Trigger rerun
+    
     with c_btn3:
         # CSV 导出逻辑
         export_data = []
-        for line in st.session_state.raw_data.strip().split('\n'):
-            if '|' in line:
-                p = line.split('|')
-                export_data.append({'range': p[0], 'level': p[1]})
+        lines = st.session_state.raw_data.strip().split('\n')
+        for line in lines:
+            if not line.strip() or '|' not in line: continue
+            p = line.split('|')
+            # 尝试清洗数据
+            r_val = p[0].strip()
+            l_val = p[1].strip()
+            # 统一导出为新版 Key (可选，或者保持原样)
+            # l_val = LEVELS.get(l_val, {}).get('label', l_val) 
+            export_data.append({'range': r_val, 'level': l_val})
+            
         if export_data:
             csv_str = pd.DataFrame(export_data).to_csv(index=False).encode('utf-8')
-            st.download_button("💾 导出CSV", csv_str, "hdd_scan.csv", "text/csv", use_container_width=True)
+            st.download_button("💾 导出CSV", csv_str, "bad_sectors.csv", "text/csv", use_container_width=True)
+        else:
+            st.button("💾 导出CSV", disabled=True, use_container_width=True)
 
     # 1. 新增功能：等级过滤器
     # 默认全选，获取 LEVELS 的所有 key
@@ -316,7 +387,8 @@ with col_main_ui:
     # 文本框
     st.session_state.raw_data = st.text_area("输入 (LBA范围|Level|点数)", 
                                              value=st.session_state.raw_data, 
-                                             height=400)
+                                             height=400,
+                                             help="支持格式：\n100-200|L4\n5000|ERR")
     
     # 图例表
     st.markdown("---")
@@ -343,11 +415,23 @@ with col_main_ui:
 with col_viz:
     # 视图控制
     st.subheader("💿 物理视图")
-    # 保持视图状态
-    view_opt = st.radio("显示模式", ["Merge All Surfaces", "Individual Surfaces"], 
-                        index=0 if st.session_state.view_mode == "Merge All Surfaces" else 1,
-                        horizontal=True)
-    st.session_state.view_mode = view_opt
+
+    # c_ctrl1 单选框，c_ctrl2 滑块
+    c_ctrl1, c_ctrl2 = st.columns([1, 1], gap="medium")
+    with c_ctrl1:
+        view_opt = st.radio("显示模式", ["Merge All Surfaces", "Individual Surfaces"], 
+                            index=0 if st.session_state.view_mode == "Merge All Surfaces" else 1,
+                            horizontal=True)
+        # 保持视图状态
+        st.session_state.view_mode = view_opt
+
+    cols_per_row = 4
+    with c_ctrl2:
+        # 仅在分层视图下显示滑块
+        if view_opt == "Individual Surfaces":
+            slider_max = min(max(1, c_heads), 8)
+            slider_default = min(4, slider_max)
+            cols_per_row = st.slider("每行图表数", min_value=1, max_value=slider_max, value=slider_default, key="cols_slider")
 
     # 解析数据
     plot_items = []
@@ -371,44 +455,60 @@ with col_viz:
         
         # 逻辑：单点、指定点数或小范围画散点；大范围画弧线
         if s == e or cnt > 0:
+            # 散点模式
             num = max(1, cnt)
             for lba in np.linspace(s, e, num):
-                _, h, th, r_norm = lba_to_chs(lba, c_heads, A, B, Total_Cyls)
+                c, h, th, r_norm = lba_to_chs(lba, c_heads, A, B, Total_Cyls)
                 r_vis = 1.0 - r_norm * (1.0 - r_in_ratio)
                 plot_items.append({'type': 'pt', 'h': h, 'r': r_vis, 'th': th, 'c': color})
         else:
-            # 弧线逻辑
-            _, h1, th1, rn1 = lba_to_chs(s, c_heads, A, B, Total_Cyls)
-            _, h2, th2, rn2 = lba_to_chs(e, c_heads, A, B, Total_Cyls)
-            r_vis = 1.0 - rn1 * (1.0 - r_in_ratio)
+            # 弧线模式 (Range Mode)
+            # 获取起点和终点的完整坐标，包括整数柱面索引 c1, c2
+            c1, h1, th1, rn1 = lba_to_chs(s, c_heads, A, B, Total_Cyls)
+            c2, h2, th2, rn2 = lba_to_chs(e, c_heads, A, B, Total_Cyls)            
+            # 计算各自的可视化半径 (跨柱面时半径不同)
+            r_vis1 = 1.0 - rn1 * (1.0 - r_in_ratio)
+            r_vis2 = 1.0 - rn2 * (1.0 - r_in_ratio)
             
-            # 如果起始和结束不在同一个圆环(radius)或者跨度极大，
-            # 为了避免画图混乱，建议降级为画点，或者只画一段
-            is_same_cyl = (rn1 == rn2) 
+            if c1 == c2:
+                # 情况 A: 完全在同一个柱面、同一个磁头上 -> 画一条简单的弧
+                if h1 == h2:
+                    plot_items.append({'type': 'arc', 'h': h1, 'r': r_vis1, 't1': th1, 't2': th2, 'c': color})
             
-            if h1 == h2 and is_same_cyl:
-                # 同柱面同磁头：正常画弧
-                 plot_items.append({'type': 'arc', 'h': h1, 'r': r_vis, 't1': th1, 't2': th2, 'c': color})
-            else:
-                # 跨磁头或跨柱面
-                # 简化处理：画一段完整的弧代表这个区域繁忙
-                # 或者：只画起点到终点的连线可能不准确，这里改为画几个离散点或者一段特定弧
-                # 下面是一个简化的“单圈处理”，防止报错：
-                
-                if not is_same_cyl:
-                     # 跨柱面了，简单起见，只画起点所在磁头的剩余部分
-                     plot_items.append({'type': 'arc', 'h': h1, 'r': r_vis, 't1': th1, 't2': 2*np.pi, 'c': color})
+                # 情况 B: 同一柱面，但跨磁头 (例如 Head 0 末尾 -> Head 1 开头)
                 else:
-                    # 同柱面，跨磁头 (h1 -> h2)
-                    if h1 < h2:
-                        plot_items.append({'type': 'arc', 'h': h1, 'r': r_vis, 't1': th1, 't2': 2*np.pi, 'c': color})
-                        for mh in range(h1+1, h2):
-                            plot_items.append({'type': 'arc', 'h': mh, 'r': r_vis, 't1': 0, 't2': 2*np.pi, 'c': color})
-                        plot_items.append({'type': 'arc', 'h': h2, 'r': r_vis, 't1': 0, 't2': th2, 'c': color})
-                    else:
-                        # h1 > h2 这种情况通常不会在同柱面发生(除非数据排序错)，
-                        # 但如果是物理柱面一样计算出了误差，就按点画
-                        pass
+                    # 1. 起点磁头：从 th1 画到 2pi (一圈结束)
+                    plot_items.append({'type': 'arc', 'h': h1, 'r': r_vis1, 't1': th1, 't2': 2*np.pi, 'c': color})
+                    
+                    # 2. 中间磁头：画整圈 (如果跨了多个磁头)
+                    # 磁头写入顺序 0->1->2...,不应该出现h1 > h2
+                    if h1 + 1 < h2:
+                        for mh in range(h1 + 1, h2):
+                            plot_items.append({'type': 'arc', 'h': mh, 'r': r_vis1, 't1': 0, 't2': 2*np.pi, 'c': color})
+                    # 3. 终点磁头：从 0 画到 th2
+                    plot_items.append({'type': 'arc', 'h': h2, 'r': r_vis1, 't1': 0, 't2': th2, 'c': color})
+
+            # 情况 C: 跨柱面
+            # 如：Cyl 100/Head 1(End) -> Cyl 102/Head 0(Start)
+            # 则
+            #   若c2-c1=1: c1: h1 ->  h_end, c2: h0 -> h2;
+            #   若c2-c1>1: 各head全部画满一圈表达之
+            else:
+                # 起点 -> 该磁道末尾
+                plot_items.append({'type': 'arc', 'h': h1, 'r': r_vis1, 't1': th1, 't2': 2*np.pi, 'c': color})
+                #全部画一圈
+                if c2 - c1 == 1:
+                    # 起点 -> 后续磁头
+                    for mh in range(h1 + 1, c_heads):
+                        plot_items.append({'type': 'arc', 'h': mh, 'r': r_vis1, 't1': 0, 't2': 2*np.pi, 'c': color})
+                    # 首磁头 -> 终点
+                    for mh in range(0, h2):
+                        plot_items.append({'type': 'arc', 'h': mh, 'r': r_vis2, 't1': 0, 't2': 2*np.pi, 'c': color})
+                else:
+                    for mh in range(0, c_heads):
+                        plot_items.append({'type': 'arc', 'h': mh, 'r': r_vis1, 't1': 0, 't2': 2*np.pi, 'c': color})
+                # 终点所在位置 -> 该磁道开头
+                plot_items.append({'type': 'arc', 'h': h2, 'r': r_vis2, 't1': 0, 't2': th2, 'c': color})
 
     # 绘图辅助函数
     def draw_background(ax, r_in):
@@ -434,7 +534,7 @@ with col_viz:
 
         # 辅助线 a: 轴线 (仅在 Ring 内)
         for angle in np.linspace(0, 2*np.pi, 8, endpoint=False):
-            ax.plot([angle, angle], [r_in, 1.0], color='#CCC', lw=0.5)
+            ax.plot([angle, angle], [r_in, 1.0], color='#CCC', lw=0.5, ls=':')
 
     # 渲染
     if view_opt == "Merge All Surfaces":
@@ -452,21 +552,26 @@ with col_viz:
         st.pyplot(fig)
 
     else: # Individual Surfaces
-        # 使用 cols 布局，每个图是一个单独的 figure，方便单独放大
-        cols = st.columns(4) # 两列排布
-        for h_idx in range(c_heads):
-            with cols[h_idx % 4]:
-                fig, ax = plt.subplots(subplot_kw={'projection': 'polar'}, figsize=(5, 5))
-                draw_background(ax, r_in_ratio)
-                ax.set_title(f"Head {h_idx}", y=1.05)
-                
-                # 筛选当前磁头数据
-                h_items = [p for p in plot_items if p['h'] == h_idx]
-                for p in h_items:
-                    if p['type'] == 'pt': 
-                        ax.scatter(p['th'], p['r'], c=p['c'], s=15, edgecolors='none')
-                    elif p['type'] == 'arc':
-                        ts = np.linspace(p['t1'], p['t2'], 50)
-                        ax.plot(ts, [p['r']]*50, color=p['c'], lw=1.5)
-                
-                st.pyplot(fig) # 独立的 pyplot 允许用户 hover 时单独放大
+        total_rows: int = (c_heads + cols_per_row - 1) // cols_per_row #type: ignore
+
+        for row in range(total_rows):
+            cols = st.columns(cols_per_row)
+            for i in range(cols_per_row):
+                h_idx = row * cols_per_row + i
+                if h_idx < c_heads:
+                    with cols[i]:
+                        fig, ax = plt.subplots(subplot_kw={'projection': 'polar'}, figsize=(5, 5))
+                        draw_background(ax, r_in_ratio)
+                        ax.set_title(f"Head {h_idx}", y=1.05)
+                        
+                        # 筛选数据
+                        h_items = [p for p in plot_items if p['h'] == h_idx]
+                        
+                        for p in h_items:
+                            if p['type'] == 'pt': 
+                                ax.scatter(p['th'], p['r'], c=p['c'], s=15, edgecolors='none')
+                            elif p['type'] == 'arc':
+                                ts = np.linspace(p['t1'], p['t2'], 50)
+                                ax.plot(ts, [p['r']]*50, color=p['c'], lw=1.5)
+                        
+                        st.pyplot(fig)# 独立的 pyplot 允许 hover 时单独放大
