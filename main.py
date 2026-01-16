@@ -8,7 +8,7 @@ import re
 from io import StringIO
 
 # --- 1. 配置与全局常量 ---
-st.set_page_config(page_title="HDD Physical Diagnostic V4.1", layout="wide")
+st.set_page_config(page_title="HDD Physical Diagnostic V4.4", layout="wide")
 
 # --- CSS 样式注入：解决 Padding 过大问题 ---
 st.markdown("""
@@ -55,16 +55,16 @@ if 'view_mode' not in st.session_state: st.session_state.view_mode = "Merge All 
 if 'raw_data' not in st.session_state: st.session_state.raw_data = ""
 if 'edit_mode' not in st.session_state: st.session_state.edit_mode = False
 if 'hdd_sn' not in st.session_state: st.session_state.hdd_sn = ""
+if 'target_preset_idx' not in st.session_state: st.session_state.target_preset_idx = 0
 
-# --- 3. 核心物理计算 (修正版) ---
-
+# --- 3. 核心物理计算---
 def calculate_zbr_params(lba_max, heads, rpm, s_out, s_in):
     """
     计算 ZBR 物理参数
     假设 SPT (Sectors Per Track) 从外向内线性递减
     """
     rps = rpm / 60.0
-    # 物理扇区大小 512B
+    # 扇区：物理 4K，逻辑 512B——LBA=Logical Block Addressing
     spt_out = (s_out * 1_000_000) / (512 * rps)
     spt_in = (s_in * 1_000_000) / (512 * rps)
     
@@ -84,23 +84,19 @@ def lba_to_chs(lba, heads, A, B, total_cyls):
     """
     H = heads
     
-    # --- 修正点 1: 判别式系数修正 ---
+    # --- 判别式系数 ---
     # 公式: 0.5*B*H * cyl^2 - A*H * cyl + lba = 0
     # a = 0.5*B*H, b = -A*H, c = lba
-    # delta = b^2 - 4ac = (AH)^2 - 4*(0.5BH)*lba = (AH)^2 - 2*B*H*lba
-    
+    # delta = b^2 - 4ac = (AH)^2 - 4*(0.5BH)*lba = (AH)^2 - 2*B*H*lba    
     if B == 0: # 恒定速度 (非 ZBR)
         cyl_float = lba / (A * H)
     else:
-        delta = (A*H)**2 - 2 * B * H * lba  # <--- 修正了系数 (原代码少乘了2)
+        delta = (A*H)**2 - 2 * B * H * lba
         if delta < 0: delta = 0
         cyl_float = (A*H - np.sqrt(delta)) / (B*H)
 
-    # --- 修正点 2: 必须取整 ---
-    # 物理柱面是整数。cyl_float 是理论连续值，必须向下取整
-    # 才能计算出“当前柱面起始位置”
-    cyl_int = int(cyl_float)
-    
+    # 物理柱面是整数。cyl_float 是理论连续值，必须向下取整 才能计算出“当前柱面起始位置”
+    cyl_int = int(cyl_float)    
     # 防止浮点误差导致的越界
     if cyl_int >= total_cyls: cyl_int = int(total_cyls) - 1
     if cyl_int < 0: cyl_int = 0
@@ -199,17 +195,20 @@ with st.sidebar:
     # 序列号输入 (绑定 session_state) 
     st.session_state.hdd_sn = st.text_input("序列号 (S/N)", 
                                                    value=st.session_state.hdd_sn,
-                                                   placeholder="如: WD-WCC1E1ARP1XX")
-    
+                                                   placeholder="如: WD-WCC1E1ARP1XX")    
     st.divider()
-
     st.markdown("### 🛠️ 物理规格")
     
-    # 模式切换
+    preset_keys = list(presets.keys())
+    options_list = preset_keys + ["New Profile"]
+    # 如果 target_preset_idx 超出范围 (例如删除了预设)，重置为 0
+    if st.session_state.target_preset_idx >= len(options_list):
+        st.session_state.target_preset_idx = 0    
+
     col_mode, col_edit_btn = st.columns([2, 1])
     with col_mode:
-        selected_model = st.selectbox("选择预设", list(presets.keys()) + ["New Profile"], 
-                                      index=0 if "New Profile" not in list(presets.keys()) else 0,
+        selected_model = st.selectbox("选择预设", options_list, 
+                                      index=st.session_state.target_preset_idx,
                                       disabled=st.session_state.edit_mode)
     with col_edit_btn:
         if st.toggle("解锁", value=st.session_state.edit_mode):
@@ -217,8 +216,9 @@ with st.sidebar:
         else:
             st.session_state.edit_mode = False
 
-    # 数据加载
+    # 根据选择加载数据
     if selected_model == "New Profile":
+        # 默认空模板
         current_data = {'lba_max': 0, 'heads': 1, 'rpm': 7200, 'speed_out': 150.0, 'speed_in': 80.0}
         display_name = "New_HDD"
     else:
@@ -226,34 +226,53 @@ with st.sidebar:
         display_name = selected_model
 
     # 表单区域
+    # 编辑模式允许修改 Key (Model Name)；另，使用 pop 读取临时导入值，实现一次性自动填充
     with st.container(border=True):
         st.caption("参数详情")
-        # 编辑模式，允许修改 Key (Model Name)；另，使用 pop 读取临时导入值，实现一次性自动填充
-        val_model = st.session_state.pop('tmp_imported_model', display_name)
+
+        # --- 自动填入逻辑 ---
+        # 优先弹出 import 进来的临时数据，如果没有则使用当前 current_data
+
+        # 1. 型号
+        val_model = st.session_state.pop('tmp_imported_model', display_name)        
         new_model_name = st.text_input("型号名称", value=val_model, disabled=not st.session_state.edit_mode)
+        #Fix Pylance:new_model_name = st.text_input("型号名称", value=str(val_model if val_model else ""), disabled=not st.session_state.edit_mode)
+        # 2. 物理参数
         val_lba = st.session_state.pop('tmp_imported_lba', current_data['lba_max'])
-        
-        c_lba = st.number_input("LBA Max", value=current_data['lba_max'], disabled=not st.session_state.edit_mode)
-        c_heads = st.number_input("磁头数 (Heads)", value=current_data['heads'], disabled=not st.session_state.edit_mode)
-        c_rpm = st.number_input("转速 (RPM)", value=current_data['rpm'], disabled=not st.session_state.edit_mode)
-        c_s_out = st.number_input("外圈速度 (MB/s)", value=current_data['speed_out'], disabled=not st.session_state.edit_mode)
-        c_s_in = st.number_input("内圈速度 (MB/s)", value=current_data['speed_in'], disabled=not st.session_state.edit_mode)
-        
+        c_lba = st.number_input("LBA Max", value=int(val_lba), disabled=not st.session_state.edit_mode)
+
+        val_heads = st.session_state.pop('tmp_imported_heads', current_data['heads'])
+        c_heads = st.number_input("磁头数 (Heads)", value=int(val_heads), disabled=not st.session_state.edit_mode)
+
+        val_rpm = st.session_state.pop('tmp_imported_rpm', current_data['rpm'])
+        c_rpm = st.number_input("转速 (RPM)", value=int(val_rpm), disabled=not st.session_state.edit_mode)
+
+        val_sout = st.session_state.pop('tmp_imported_sout', current_data['speed_out'])
+        c_s_out = st.number_input("外圈速度 (MB/s)", value=float(val_sout), disabled=not st.session_state.edit_mode)
+
+        val_sin = st.session_state.pop('tmp_imported_sin', current_data['speed_in'])
+        c_s_in = st.number_input("内圈速度 (MB/s)", value=float(val_sin), disabled=not st.session_state.edit_mode)
+
         if st.session_state.edit_mode:
             if st.button("💾 保存配置到 YAML"):
-                # 更新 presets
-                new_entry = {
-                    'lba_max': int(c_lba), 'heads': int(c_heads), 'rpm': int(c_rpm),
-                    'speed_out': float(c_s_out), 'speed_in': float(c_s_in)
-                }
-                # 如果改了名字，删除旧的
-                if new_model_name != selected_model and selected_model != "New Profile":
-                    del presets[selected_model]
-                
-                presets[new_model_name] = new_entry
-                save_presets(presets)
-                st.toast(f"配置 {new_model_name} 已保存!")
-                st.rerun()
+                if not new_model_name:
+                    st.error("型号名称不能为空")
+                else:
+                    new_entry = {
+                        'lba_max': int(c_lba), 'heads': int(c_heads), 'rpm': int(c_rpm),
+                        'speed_out': float(c_s_out), 'speed_in': float(c_s_in)
+                    }
+                    if new_model_name != selected_model and selected_model != "New Profile":
+                        if selected_model in presets:
+                            del presets[selected_model]
+                    
+                    presets[new_model_name] = new_entry
+                    save_presets(presets)
+                    
+                    # 保存后，更新选中项索引到这个新名字
+                    st.session_state.target_preset_idx = list(presets.keys()).index(new_model_name)
+                    st.toast(f"配置 {new_model_name} 已保存!")
+                    st.rerun()
 
     # ZBR 参数计算 (用于后续绘图)
     A, B, Total_Cyls, spt_out, spt_in = calculate_zbr_params(c_lba, c_heads, c_rpm, c_s_out, c_s_in)
@@ -322,17 +341,16 @@ with col_main_ui:
         uploaded_file = st.file_uploader("选择 CSV 文件", type=["csv"])
         if uploaded_file is not None:
             try:
-                # 1. 读取文件内容为字符串以解析 Metadata
-                content = uploaded_file.getvalue().decode("utf-8").splitlines()
-                
+                # 1. 读取文件
+                content = uploaded_file.getvalue().decode("utf-8").splitlines()                
                 if not content:
                     st.error("文件为空")
                     return
                 
                 # 2. 解析第一行 Metadata
-                # 格式: Model: ...; Capacity ... LBAs; SN: ...; FW: ...
                 header_line = content[0]
-                meta_pattern = r"Model: (.*); Capacity (\d+) LBAs; SN: (.*)"
+                # Header format: Model: ...; LBA: ...; Heads: ...; RPM: ...; SO: ...; SI: ...; SN: ...
+                meta_pattern = r"Model: (.*); SN: (.*); LBA: (\d+); Heads: (\d+); RPM: (\d+); Speed: ([\d\.]+)/([\d\.]+)"
                 match = re.search(meta_pattern, header_line)
                 
                 parsed_meta = {}
@@ -340,8 +358,13 @@ with col_main_ui:
                 # 匹配 Model
                 if match:
                     parsed_meta['model'] = match.group(1).strip()
-                    parsed_meta['lba'] = int(match.group(2))
-                    parsed_meta['sn'] = match.group(3).strip()
+                    parsed_meta['sn'] = match.group(2).strip()
+                    parsed_meta['lba'] = int(match.group(3))
+                    parsed_meta['heads'] = int(match.group(4))
+                    parsed_meta['rpm'] = int(match.group(5))
+                    parsed_meta['s_out'] = float(match.group(6))
+                    parsed_meta['s_in'] = float(match.group(7))
+
                     csv_start_line = 1 # 跳过第一行
                     st.success(f"识别到硬盘: {parsed_meta['model']} (SN: {parsed_meta['sn']})")
                 else:
@@ -366,7 +389,6 @@ with col_main_ui:
                         lvl = str(row['level'])
                         # 读取 count 列，如果没有则默认为 0
                         cnt = row['count'] if 'count' in df.columns and pd.notna(row['count']) else 0
-                        
                         # 格式: range|level|count
                         new_lines.append(f"{rng}|{lvl}|{int(cnt)}")
 
@@ -381,12 +403,52 @@ with col_main_ui:
                             
                             # 如果有元数据，强制更新当前设置
                             if match:
-                                # 更新 SN
+                                imp_model = parsed_meta['model']
                                 st.session_state.hdd_sn = parsed_meta['sn']
-                                st.session_state.tmp_imported_lba = parsed_meta['lba']
-                                st.session_state.tmp_imported_model = parsed_meta['model']
-                                st.toast(f"参数已读取: model {parsed_meta['model']}, LBA {parsed_meta['lba']}.")
+
+                                preset_match_key = None
+                                if imp_model in presets:
+                                    preset_match_key = imp_model
                                 
+                                # 准备要写入侧边栏输入框的临时数据
+                                st.session_state.tmp_imported_model = imp_model
+                                st.session_state.tmp_imported_lba = parsed_meta['lba']
+                                st.session_state.tmp_imported_heads = parsed_meta['heads']
+                                st.session_state.tmp_imported_rpm = parsed_meta['rpm']
+                                st.session_state.tmp_imported_sout = parsed_meta['s_out']
+                                st.session_state.tmp_imported_sin = parsed_meta['s_in']
+                                
+                                # 存在同名预设
+                                if preset_match_key:
+                                    p_data = presets[preset_match_key]
+                                    # 检查参数一致性
+                                    is_identical = (
+                                        p_data['lba_max'] == parsed_meta['lba'] and
+                                        p_data['heads'] == parsed_meta['heads'] and
+                                        p_data['rpm'] == parsed_meta['rpm'] and
+                                        p_data['speed_out'] == parsed_meta['s_out'] and
+                                        p_data['speed_in'] == parsed_meta['s_in']
+                                    )
+                                    # 设置 Selectbox 指向该预设
+                                    idx = list(presets.keys()).index(preset_match_key)
+                                    print(f'idx={idx}')
+                                    st.session_state.target_preset_idx = idx
+
+                                    if is_identical:
+                                        # 2.1 内容一致 -> 锁定
+                                        st.session_state.edit_mode = False
+                                        st.toast(f"参数与预设 '{imp_model}' 完美匹配。")
+                                    else:
+                                        # 2.2 内容不一致 -> 解锁并提示
+                                        st.session_state.edit_mode = True
+                                        st.toast(f"预设 '{imp_model}' 存在但参数不一致，已开启编辑模式。", icon="⚠️")
+                                else:
+                                    # 情况 3: 不存在 -> 指向 New Profile
+                                    # New Profile 是列表最后一项
+                                    st.session_state.target_preset_idx = len(presets.keys()) 
+                                    st.session_state.edit_mode = True
+                                    st.toast(f"新检测到型号 '{imp_model}'，已切换至 New Profile。", icon="🆕")
+
                             st.rerun()
                     
                     with col_append:
@@ -427,6 +489,7 @@ with col_main_ui:
             
         if export_list:
             current_model_name = new_model_name if 'new_model_name' in locals() else selected_model
+            current_model_name = str(current_model_name) if current_model_name else "Unknown" # Pylance guard
             safe_model = re.sub(r'[\\/*?:"<>|]', '_', current_model_name).strip()
             safe_sn = re.sub(r'[\\/*?:"<>|]', '_', st.session_state.hdd_sn).strip()
             if not safe_sn: safe_sn = "NoSN"
@@ -435,8 +498,9 @@ with col_main_ui:
             
             # 文件内容
             # Header: Model: ...; Capacity ...; SN: ...
-            header_str = f"Model: {current_model_name}; Capacity {int(c_lba)} LBAs; SN: {st.session_state.hdd_sn}\n"
-            
+            header_str = (f"Model: {current_model_name}; SN: {st.session_state.hdd_sn}; "
+                          f"LBA: {int(c_lba)}; Heads: {int(c_heads)}; RPM: {int(c_rpm)}; "
+                          f"Speed: {float(c_s_out)}/{float(c_s_in)}\n")
             # CSV Body
             df = pd.DataFrame(export_list)
             csv_body = df.to_csv(index=False)
@@ -466,7 +530,7 @@ with col_main_ui:
                                              help="支持格式：\n100-200|L4\n5000|ERR")
     
     # 图例表
-    #st.markdown("---")
+    st.markdown("---")
     st.caption("颜色等级对照 (Victoria Delay Levels)")
     cols = st.columns(len(DELAY_LEVELS))
     for i, (k, v) in enumerate(DELAY_LEVELS.items()):
@@ -621,7 +685,7 @@ with col_viz:
             elif p['type'] == 'arc':
                 # 处理跨0度
                 ts = np.linspace(p['t1'], p['t2'], 50)
-                ax.plot(ts, [p['r']]*50, color=p['c'], lw=2, alpha=0.9)
+                ax.plot(ts, [p['r']]*50, color=p['c'], lw=1, alpha=0.9)
         st.pyplot(fig)
 
     else: # Individual Surfaces
@@ -643,6 +707,6 @@ with col_viz:
                                 ax.scatter(p['th'], p['r'], c=p['c'], s=15, edgecolors='none')
                             elif p['type'] == 'arc':
                                 ts = np.linspace(p['t1'], p['t2'], 50)
-                                ax.plot(ts, [p['r']]*50, color=p['c'], lw=1.5)
+                                ax.plot(ts, [p['r']]*50, color=p['c'], lw=0.6)
                         
                         st.pyplot(fig)# 独立的 pyplot 允许 hover 时单独放大
