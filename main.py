@@ -8,7 +8,7 @@ import re
 from io import StringIO
 
 # --- 1. 配置与全局常量 ---
-st.set_page_config(page_title="HDD Physical Diagnostic V4.4", layout="wide")
+st.set_page_config(page_title="HDD Physical Diagnostic V4.5", layout="wide")
 
 # --- CSS 样式注入：解决 Padding 过大问题 ---
 st.markdown("""
@@ -64,16 +64,19 @@ def calculate_zbr_params(lba_max, heads, rpm, s_out, s_in):
     假设 SPT (Sectors Per Track) 从外向内线性递减
     """
     rps = rpm / 60.0
+    lba_max = np.float64(lba_max)
+
     # 扇区：物理 4K，逻辑 512B——LBA=Logical Block Addressing
-    spt_out = (s_out * 1_000_000) / (512 * rps)
-    spt_in = (s_in * 1_000_000) / (512 * rps)
+    spt_out = (s_out * 1_000_000) / (512.0 * rps)
+    spt_in = (s_in * 1_000_000) / (512.0 * rps)
     
     # 平均 SPT * 磁头数 * 磁道数 = 总 LBA
-    avg_spt_per_cyl = (spt_out + spt_in) / 2 * heads
+    avg_spt_per_cyl = (spt_out + spt_in) / 2.0 * heads
     total_cylinders = lba_max / avg_spt_per_cyl
     
     # 线性方程系数: SPT(cyl) = A - B * cyl
     A = spt_out
+    if total_cylinders <= 0: total_cylinders = 1.0
     B = (spt_out - spt_in) / total_cylinders
     
     return A, B, total_cylinders, spt_out, spt_in
@@ -83,6 +86,8 @@ def lba_to_chs(lba, heads, A, B, total_cyls):
     LBA 转 CHS (Cylinder, Head, Sector) 及 归一化半径 (修正版)
     """
     H = heads
+    lba = np.float64(lba)
+    epsilon = 1e-9 # 浮点容差
     
     # --- 判别式系数 ---
     # 公式: 0.5*B*H * cyl^2 - A*H * cyl + lba = 0
@@ -91,31 +96,35 @@ def lba_to_chs(lba, heads, A, B, total_cyls):
     if B == 0: # 恒定速度 (非 ZBR)
         cyl_float = lba / (A * H)
     else:
-        delta = (A*H)**2 - 2 * B * H * lba
+        term1 = (A * H) ** 2
+        term2 = 2.0 * B * H * lba
+        delta = term1 - term2
         if delta < 0: delta = 0
         cyl_float = (A*H - np.sqrt(delta)) / (B*H)
 
     # 物理柱面是整数。cyl_float 是理论连续值，必须向下取整 才能计算出“当前柱面起始位置”
-    cyl_int = int(cyl_float)    
+    cyl_int = int(cyl_float + epsilon)    
     # 防止浮点误差导致的越界
     if cyl_int >= total_cyls: cyl_int = int(total_cyls) - 1
     if cyl_int < 0: cyl_int = 0
 
-    # 2. 计算该柱面(整数)的起始 LBA
-    # 使用 cyl_int 代入积分公式
-    lba_start_cyl = H * (A*cyl_int - 0.5*B*(cyl_int**2))
+    # 计算该柱面(整数)的起始 LBA
+    # LBA_start = H * (A*C - 0.5*B*C^2)
+    c_val = np.float64(cyl_int)
+    lba_start_cyl = H * (A*c_val - 0.5*B*(c_val**2))
     
-    # 3. 计算在当前柱面内的偏移量
+    #  计算在当前柱面内的偏移量
     lba_in_cyl = lba - lba_start_cyl
-    
-    # 4. 当前柱面的 SPT (使用整数索引计算)
-    current_spt = A - B * cyl_int
-    
-    # 5. 计算磁头 (Head) 和 角度 (Theta)
+    # 计算磁头 (Head) 和 角度 (Theta)
     # 注意：lba_in_cyl 可能因为浮点误差出现微小的负数或略大于容量，需由于 int() 截断
-    if lba_in_cyl < 0: lba_in_cyl = 0
+    if lba_in_cyl < 0: lba_in_cyl = 0.0
+
+    # 当前柱面的 SPT (使用整数索引计算)
+    current_spt = A - B * c_val    
+    if current_spt < 1.0: current_spt = 1.0
     
-    head = int(lba_in_cyl // current_spt)
+    # 计算磁头 (Head)
+    head = int((lba_in_cyl + epsilon) // current_spt)
     if head >= heads: head = heads - 1 # 钳位
     
     sector_offset = lba_in_cyl % current_spt
@@ -183,6 +192,101 @@ def get_grade(ms_val, block_size_key):
     if ms_val < thresholds[1]: return 'L2'
     if ms_val < thresholds[2]: return 'L3'
     return 'L4'
+
+def update_memo_with_gb(raw_text):
+    """
+    5列格式化    Range | Level | Count | [xx.xxGB] | Memo
+    """
+    if not raw_text: return ""    
+    lines = raw_text.split('\n')
+    parsed_rows = []
+
+    max_len_rng = 20
+    max_len_lvl = 6
+    max_len_cnt = 5
+    
+    for line in lines:
+        if not line.strip() or '|' not in line:
+            parsed_rows.append({'type': 'raw', 'content': line})
+            continue
+            
+        parts = [p.strip() for p in line.split('|')]
+        # 补齐列数到 5 列 (Range, Level, Count, Memo)
+        while len(parts) < 5:
+            parts.append("")
+        
+        # RANGE
+        rng = parts[0].strip().replace(" ", "") # 去空格
+
+        # Level 校验
+        lvl = parts[1].strip()
+        if lvl.upper() in DELAY_LEVELS:
+            lvl = lvl.upper()
+        elif lvl == "":
+            lvl = "ERR" # 默认值
+
+        # Count 校验
+        cnt_str = parts[2].strip()
+        if not cnt_str.isdigit():
+             cnt_str = "0"
+
+        memo = parts[4].strip()
+
+        # 计算 GB (忽略输入值，总是重新计算以保证准确)
+        gb_tag = ""
+        lba_match = re.match(r'^(\d+)', rng)
+        if lba_match:
+            lba_start = int(lba_match.group(1))
+            # 尝试查找结束LBA '100-200'
+            lba_end = None
+            if '-' in rng:
+                parts_rng = rng.split('-')
+                if len(parts_rng) > 1 and parts_rng[1].isdigit():
+                     lba_end = int(parts_rng[1])
+
+            gb_val_start = lba_start * 512 / (1000**3)
+            gb_tag = f"[{gb_val_start:.2f}GB]"
+            if lba_end:
+                 gb_val_end = lba_end * 512 / (1000**3)
+                 if gb_val_end - gb_val_start > 0.01:
+                    gb_tag = f"[{gb_val_start:.2f}-{gb_val_end:.2f}GB]"
+        
+        # 记录每列最大宽度以便对齐
+        max_len_rng = max(max_len_rng, len(rng))
+        max_len_lvl = max(max_len_lvl, len(lvl))
+        max_len_cnt = max(max_len_cnt, len(cnt_str))
+
+        parsed_rows.append({
+            'type': 'data',
+            'rng': rng,
+            'lvl': lvl,
+            'cnt': cnt_str,
+            'gb': gb_tag,
+            'memo': memo
+        })
+            
+    # 重组并对齐
+    new_lines = []
+    # 设定最小宽度，避免太挤
+    max_len_rng = max(max_len_rng, 20)
+
+    for row in parsed_rows:
+        if row['type'] == 'raw':
+            new_lines.append(row['content'])
+        else:
+            # 使用 ljust(width) 进行左对齐补空格
+            s_rng = row['rng'].ljust(max_len_rng)
+            s_lvl = row['lvl'].ljust(max_len_lvl) # Level 固定宽度
+            s_cnt = row['cnt'].ljust(max_len_cnt) # Count 固定宽度
+            s_gb = row['gb'].ljust(12)
+            s_memo = row['memo']
+            
+            # 组合
+            new_line = f"{s_rng} | {s_lvl} | {s_cnt} | {s_gb} | {s_memo}"
+            new_lines.append(new_line)
+            
+    return "\n".join(new_lines)
+
 
 # --- 5. UI: 侧边栏配置 ---
 presets = load_presets()
@@ -267,8 +371,7 @@ with st.sidebar:
                             del presets[selected_model]
                     
                     presets[new_model_name] = new_entry
-                    save_presets(presets)
-                    
+                    save_presets(presets)                    
                     # 保存后，更新选中项索引到这个新名字
                     st.session_state.target_preset_idx = list(presets.keys()).index(new_model_name)
                     st.toast(f"配置 {new_model_name} 已保存!")
@@ -283,18 +386,18 @@ with st.sidebar:
 def log_helper():
     st.markdown("##### 粘贴扫描日志")
     
-    # 选项合并逻辑
+    # 选项
     bs_options = ["1/64/128/256", "512", "1024", "2048", "4096", "8192", "16384", "32768", "65535"]
     
     # 查找 session 中记忆的 index
-    def_idx = st.session_state.block_size_idx
-    selected_bs_str = st.selectbox("Block Size", bs_options, index=def_idx, key="bs_selector")
+    selected_bs_str = st.selectbox("Block Size", bs_options, 
+                                   index=st.session_state.block_size_idx, 
+                                   key="bs_selector")
     
     # 更新blocksize选项记忆
-    new_idx = bs_options.index(selected_bs_str)
-    if new_idx != st.session_state.block_size_idx:
-        st.session_state.block_size_idx = new_idx
-        st.rerun()
+    if selected_bs_str in bs_options:
+        st.session_state.block_size_idx = bs_options.index(selected_bs_str)
+
 
     # 将选项字符串转为 key
     if selected_bs_str == "1/64/128/256": bs_key = 'small'; bs_int = 256
@@ -315,14 +418,15 @@ def log_helper():
                 lba_s = int(m1.group(1))
                 ms = int(m1.group(2))
                 grade = get_grade(ms, bs_key)
-                added.append(f"{lba_s}-{lba_s + bs_int - 1}|{grade}|0")
+                added.append(f"{lba_s}-{lba_s + bs_int - 1}|{grade}|0||")
             elif m2:
                 lba_s = int(m2.group(1))
                 grade = 'ERR'
-                added.append(f"{lba_s}-{lba_s + bs_int - 1}|{grade}|0")
+                added.append(f"{lba_s}-{lba_s + bs_int - 1}|{grade}|0||")
         
         if added:
-            st.session_state.raw_data += ("\n" if st.session_state.raw_data else "") + "\n".join(added)
+            new_block = "\n".join(added)
+            st.session_state.raw_data += ("\n" if st.session_state.raw_data else "") + new_block
             st.rerun()
 
 # --- 7. 主界面布局 ---
@@ -389,10 +493,13 @@ with col_main_ui:
                         lvl = str(row['level'])
                         # 读取 count 列，如果没有则默认为 0
                         cnt = row['count'] if 'count' in df.columns and pd.notna(row['count']) else 0
-                        # 格式: range|level|count
-                        new_lines.append(f"{rng}|{lvl}|{int(cnt)}")
+                        memo = str(row['memo']) if 'memo' in df.columns and pd.notna(row['memo']) else ""
+
+                        # 组合 4 列，格式: range|level|count|memo
+                        new_lines.append(f"{rng}|{lvl}|{int(cnt)}||{memo}")
 
                     new_data_str = "\n".join(new_lines)
+                    new_data_str = update_memo_with_gb(new_data_str)
 
                     col_overwrite, col_append = st.columns(2)
 
@@ -470,22 +577,23 @@ with col_main_ui:
         if st.button("📂 导入CSV", use_container_width=True): import_helper()
 
     with c_btn4: 
-        if st.button("🚀 更新图表", type="primary", use_container_width=True): pass # Trigger rerun
-    
-    with c_btn3:
-        # CSV 导出逻辑
-        export_list = []
-        lines = st.session_state.raw_data.strip().split('\n')
-        for line in lines:
-            if not line.strip() or '|' not in line: continue
-            p = line.split('|')
-            # 清洗数据
-            r_val = p[0].strip()
-            l_val = p[1].strip()
-            # 获取点数，缺省为 0
-            c_val = int(p[2]) if len(p) > 2 and p[2].strip().isdigit() else 0
+        if st.button("🚀 更新图表", type="primary", use_container_width=True):
+            st.session_state.raw_data = update_memo_with_gb(st.session_state.raw_data)
+            st.rerun()
 
-            export_list.append({'range': r_val, 'level': l_val, 'count': c_val})
+    with c_btn3:
+        # CSV 导出逻辑(4列: Range, Level, Count, Memo)
+        export_list = []
+        lines_raw = st.session_state.raw_data.strip().split('\n')
+        for line in lines_raw:
+            if not line.strip() or '|' not in line: continue
+            parts = [p.strip() for p in line.split('|')]
+            r_val = parts[0]
+            l_val = parts[1] if len(parts) > 1 else ""
+            c_val = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+            m_val = parts[4] if len(parts) > 4 else ""
+
+            export_list.append({'range': r_val, 'level': l_val, 'count': c_val, 'memo': m_val})
             
         if export_list:
             current_model_name = new_model_name if 'new_model_name' in locals() else selected_model
@@ -503,6 +611,7 @@ with col_main_ui:
                           f"Speed: {float(c_s_out)}/{float(c_s_in)}\n")
             # CSV Body
             df = pd.DataFrame(export_list)
+            df = df[['range', 'level', 'count', 'memo']]
             csv_body = df.to_csv(index=False)
             final_csv_content = header_str + csv_body
             
@@ -514,8 +623,7 @@ with col_main_ui:
         else:
             st.button("💾 导出CSV", disabled=True, use_container_width=True)
 
-    # 1. 新增功能：等级过滤器
-    # 默认全选，获取 LEVELS 的所有 key
+    # 等级过滤器：默认全选，获取 LEVELS 的所有 key
     all_levels = list(DELAY_LEVELS.keys())
     selected_levels = st.multiselect(
         "👁️ 视图过滤器 (显示特定等级)",
@@ -524,7 +632,7 @@ with col_main_ui:
     )
 
     # 文本框
-    st.session_state.raw_data = st.text_area("输入 (LBA范围|Level|点数)", 
+    st.session_state.raw_data = st.text_area("输入 (LBA范围 | Level | Count(显示点数 0即默认描绘圆弧) | GB | Memo)", 
                                              value=st.session_state.raw_data, 
                                              height=400,
                                              help="支持格式：\n100-200|L4\n5000|ERR")
@@ -575,11 +683,11 @@ with col_viz:
     # 解析数据
     plot_items = []
     lines = st.session_state.raw_data.strip().split('\n')
-
     for line in lines:
         if not line.strip() or '|' not in line: continue
         parts = line.split('|')
-        rng = parts[0].strip()
+        raw_rng = parts[0].strip()
+        rng = re.sub(r'\([\d\.]+[Gg][Bb]\)', '', raw_rng) # 剔除显示用的 GB 信息
 
         lvl = parts[1].strip().upper()        
         # 过滤：如果不在多选框中，直接跳过
@@ -683,9 +791,11 @@ with col_viz:
             if p['type'] == 'pt': 
                 ax.scatter(p['th'], p['r'], c=p['c'], s=20, edgecolors='none', alpha=0.9)
             elif p['type'] == 'arc':
-                # 处理跨0度
-                ts = np.linspace(p['t1'], p['t2'], 50)
-                ax.plot(ts, [p['r']]*50, color=p['c'], lw=1, alpha=0.9)
+                # 动态计算分辨率：根据弧度跨度决定点数，最小 2 点，每 1 度至少 1 个点
+                arc_span = abs(p['t2'] - p['t1'])
+                dynamic_res = max(2, int(arc_span * 60)) # *60 约等于每度一个点
+                ts = np.linspace(p['t1'], p['t2'], dynamic_res)
+                ax.plot(ts, [p['r']]*dynamic_res, color=p['c'], lw=1, alpha=0.9)
         st.pyplot(fig)
 
     else: # Individual Surfaces
@@ -706,7 +816,10 @@ with col_viz:
                             if p['type'] == 'pt': 
                                 ax.scatter(p['th'], p['r'], c=p['c'], s=15, edgecolors='none')
                             elif p['type'] == 'arc':
-                                ts = np.linspace(p['t1'], p['t2'], 50)
-                                ax.plot(ts, [p['r']]*50, color=p['c'], lw=0.6)
+                                # 动态分辨率
+                                arc_span = abs(p['t2'] - p['t1'])
+                                dynamic_res = max(2, int(arc_span * 60))                                
+                                ts = np.linspace(p['t1'], p['t2'], dynamic_res)
+                                ax.plot(ts, [p['r']]*dynamic_res, color=p['c'], lw=0.6)
                         
                         st.pyplot(fig)# 独立的 pyplot 允许 hover 时单独放大
