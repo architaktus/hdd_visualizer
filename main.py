@@ -10,7 +10,11 @@ from dotenv import load_dotenv, set_key
 import glob
 
 # --- 1. 配置与全局常量 ---
-st.set_page_config(page_title="HDD Physical Diagnostic V4.5", layout="wide")
+st.set_page_config(page_title="HDD Physical Diagnostic V4.6", layout="wide")
+
+if 'pending_toast' in st.session_state and st.session_state.pending_toast:
+    st.toast(st.session_state.pending_toast['msg'], duration=st.session_state.pending_toast.get('duration'))
+    st.session_state.pending_toast = None # 清空
 
 # --- CSS 样式注入：解决 Padding 过大问题 ---
 st.markdown("""
@@ -27,6 +31,11 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 PRESETS_FILE = "hdd_presets.yaml"
+INVENTORY_DIR = "Data"
+HIST_DIR = os.path.join(INVENTORY_DIR, "History")
+INVENTORY_FILE = os.path.join(INVENTORY_DIR, "hdd_inventory.yaml")
+if not os.path.exists(INVENTORY_DIR):
+    os.makedirs(INVENTORY_DIR)
 
 # 加载环境变量
 ENV_FILE = ".env"
@@ -191,6 +200,63 @@ def capacity_percent_to_radius(percent, A, B, total_cyls, r_in_ratio):
     return visual_r
 
 # --- 4. 辅助功能 ---
+def load_inventory():
+    if not os.path.exists(INVENTORY_FILE):
+        return {}
+    with open(INVENTORY_FILE, 'r', encoding='utf-8') as f:
+        return yaml.safe_load(f) or {}
+
+def save_inventory(data):
+    with open(INVENTORY_FILE, 'w', encoding='utf-8') as f:
+        yaml.dump(data, f, allow_unicode=True, sort_keys=False)
+
+def register_hdd(sn, model, associated_file=None, memo=None):
+    """ 注册或更新硬盘信息 """
+    if not sn: return False
+    inv = load_inventory()
+    
+    # 如果已存在，保留原有历史，更新模型
+    if sn not in inv:
+        inv[sn] = {'model': model, 'history': [], 'memo': ''}
+
+    # 更新字段
+    inv[sn]['model'] = model
+    if memo is not None: # 仅当传入 memo 时才更新，防止覆盖
+        inv[sn]['memo'] = memo
+        
+    # 如果有关联文件，追加到历史记录
+    if associated_file:
+        if 'history' not in inv[sn]: inv[sn]['history'] = []
+        if associated_file not in inv[sn]['history']:
+            inv[sn]['history'].append(associated_file)
+
+    save_inventory(inv)
+    return True
+
+def delete_hdd(sn):
+    """ 删除库存记录 """
+    inv = load_inventory()
+    if sn in inv:
+        del inv[sn]
+        save_inventory(inv)
+        return True
+    return False
+
+def get_inventory_options(inv_data):
+    """ 生成下拉菜单的选项列表: SN - Model (Memo) """
+    options = []
+    for sn, data in inv_data.items():
+        mod = data.get('model', 'Unknown')
+        mem = data.get('memo', '')
+        # 格式化显示：WD-XXX | Model (备注...)
+        display_str = f"{sn} | {mod}"
+        if mem:
+            short_mem = (mem[:10] + '..') if len(mem) > 10 else mem
+            display_str += f" ({short_mem})"
+        options.append(display_str)
+    return options
+
+
 
 # --- ENV 管理 ---
 def get_log_path():
@@ -362,6 +428,185 @@ def format_columns(raw_text, sort=False):
 # --- 5. UI: 侧边栏配置 ---
 presets = load_presets()
 
+
+# --- 定义库存管理弹窗 ---
+@st.dialog("📦 资产列表管理", width="large")
+def inventory_manager_dialog():
+    inv_data = load_inventory()
+    
+    if not inv_data:
+        st.info("暂无库存记录，请在侧边栏注册新设备。")
+        if st.button("关闭"): st.rerun()
+    else:
+        st.caption("勾选 **Load** 加载配置，双击 **Memo** 修改备注。勾选 **删除** 移除记录")
+        
+        # --- A. 数据转换 ---
+        table_data = []
+        sorted_keys = sorted(inv_data.keys())
+
+        for sn_key in sorted_keys:
+            info = inv_data[sn_key]
+            history_list = info.get('history', [])
+            history_str = ", ".join(history_list) if history_list else ""
+
+            table_data.append({
+                "加载": False,
+                "删除": False, # 新增删除列
+                "SN": sn_key,
+                "Model": info['model'],
+                "Memo": info.get('memo', ''),
+                "History": history_str
+            })
+        
+        df = pd.DataFrame(table_data)
+
+        # --- B. 渲染宽屏表格 ---
+        edited_df = st.data_editor(
+        df,
+        key="inventory_editor_dialog",
+        hide_index=True,
+        width='stretch',
+        height=400,
+        disabled=["SN", "Model", "History"],
+        column_config={
+            "加载": st.column_config.CheckboxColumn("Load", width="small"),
+            "删除": st.column_config.CheckboxColumn("Del", width="small"), # 删除列配置
+            "Model": st.column_config.TextColumn("Model", width="medium"),
+            "SN": st.column_config.TextColumn("Serial Number", width="medium"),
+            "Memo": st.column_config.TextColumn("Memo (可编辑)", width="medium"),
+            "History": st.column_config.TextColumn("History Files", width="large", help="关联的历史CSV文件")
+        }
+    )
+
+        # --- C. 逻辑处理 ---
+        
+        # C1. 自动保存 Memo 修改
+        # Streamlit 的 dialog 在内部交互时保持开启，不会因为数据刷新而关闭
+        is_changed = False
+        for index, row in edited_df.iterrows():
+            sn_key = row['SN']
+            new_memo = row['Memo']
+            if inv_data[sn_key].get('memo', '') != new_memo:
+                inv_data[sn_key]['memo'] = new_memo
+                is_changed = True
+        
+        if is_changed:
+            save_inventory(inv_data)
+            st.toast("备注已保存 ✅")
+        
+        # C2. 处理删除动作
+        rows_to_delete = edited_df[edited_df["删除"] == True]
+        if not rows_to_delete.empty:
+            st.divider()
+            with st.container(border=True):
+                st.markdown("#### ⚠️ 删除确认")
+                
+                # 列出即将删除的 SN
+                delete_sns = rows_to_delete['SN'].tolist()
+                st.warning(f"⚠️ 确定要永久删除设备`{delete_sns}`及其关联记录吗？ {len(delete_sns)} 条记录")
+                
+                col_del_conf, col_del_cancel = st.columns([1, 4])
+                
+                # 确认按钮
+                with col_del_conf:
+                    if st.button("🚨 确认删除", type="primary", width='stretch'):
+                        for sn in delete_sns:
+                            delete_hdd(sn)
+                        st.toast(f"已删除 {len(delete_sns)} 条记录")
+                        st.rerun() # 刷新以更新表格
+                
+                # 提示文本
+                with col_del_cancel:
+                    st.caption("取消：取消上方表格中的“删除”勾选")
+
+        # C3. 处理加载动作 (分步确认)
+        selected_rows = edited_df[edited_df["加载"] == True]
+        
+        if not selected_rows.empty:
+            # 取最后勾选的一个
+            target_row = selected_rows.iloc[-1]
+            target_sn = target_row['SN']
+            target_model = target_row['Model']
+            
+            # 获取真实的历史文件列表 (从 inv_data 取，因为 df 里是字符串)
+            history_files = inv_data[target_sn].get('history', [])
+            
+            st.divider()
+            st.markdown(f"#### 📥 准备加载: `{target_sn}`")
+            
+            # --- 二级确认区 ---
+            c_conf, c_act = st.columns([3, 1])
+            
+            target_file_path = None
+            load_csv_data = False
+            
+            with c_conf:
+                # 如果有历史文件，询问是否加载
+                if history_files:
+                    # 默认选择最新的一个（假设列表最后是新的）
+                    target_file = st.selectbox("是否同步读取历史 CSV 数据？", 
+                                            options=["不读取 (仅加载参数)"] + history_files[::-1],
+                                            index=1 if history_files else 0)
+                    
+                    if target_file != "不读取 (仅加载参数)":
+                        load_csv_data = True
+                        target_file_path = os.path.join(HIST_DIR, target_file)
+                else:
+                    st.info("此设备无关联的历史 CSV 文件，仅加载物理参数。")
+
+            with c_act:
+                st.write("") # Spacer
+                if st.button("🚀 确认执行", type="primary", width='stretch'):
+                    # 1. 设置 SN
+                    st.session_state.hdd_sn = target_sn
+                    st.session_state["sn_input_widget"] = target_sn
+                    msg_list = []
+                    
+                    # 2. 设置 Model
+                    if target_model in presets:
+                        st.session_state.selected_preset = target_model
+                        st.session_state.tmp_imported_model = target_model
+                        st.session_state.edit_mode = False
+                        msg_list.append(f"参数: {target_model}。\r\n")
+                    else:
+                        msg_list.append(f"预设缺失: {target_model}，仅加载 SN。\r\n")
+
+                    # 3. 读取 CSV (如果选择了)
+                    if load_csv_data and target_file_path:
+                        # 尝试读取文件
+                        if os.path.exists(target_file_path):
+                            try:
+                                df_csv = pd.read_csv(target_file_path, encoding='utf-8')
+                                df_csv = df_csv.fillna("")
+
+                                if 'range' in df_csv.columns and 'level' in df_csv.columns:
+                                    new_lines = []
+                                    for _, r in df_csv.iterrows():
+                                        rng = str(r['range'])
+                                        lvl = str(r['level'])
+                                        cnt = r['count'] if 'count' in df_csv.columns else 0
+                                        memo = r['memo'] if 'memo' in df_csv.columns else ""
+                                        new_lines.append(f"{rng}|{lvl}|{cnt}||{memo}")
+                                    
+                                    # 格式化并更新
+                                    raw_str = "\n".join(new_lines)
+                                    st.session_state.raw_data = format_columns(raw_str, sort=True)
+                                    msg_list.append(f"历史数据已加载: {target_file_path}\r\n")
+                                else:
+                                    msg_list.append("CSV 格式不兼容")
+                            except Exception as e:
+                                #print("正在尝试显示提示 ERR! 无法读取文件")
+                                st.error(f"无法读取文件: {e}")
+                                return
+                        else:
+                            print("正在尝试显示提示 ERR! 找不到文件")
+                            st.toast(f"ERR! 找不到文件: {target_file_path}", duration="long")
+                            return
+                    
+                    # 刷新主界面，关闭弹窗
+                    st.session_state.pending_toast = {'msg': " | ".join(msg_list), 'duration': 'long'}
+                    st.rerun()
+
 with st.sidebar:
     st.title("⚙️ 硬盘工具箱")
 
@@ -370,7 +615,7 @@ with st.sidebar:
         st.markdown("**🧮 LBA 转换器**")
         c1, c2 = st.columns([2, 1])
         cal_lba = c1.text_input("输入 LBA", placeholder="12345678", label_visibility="collapsed").replace(" ", "")
-        if c2.button("📲", use_container_width=True):
+        if c2.button("📲", width='stretch'):
             if cal_lba.isdigit():
                 val = int(cal_lba) * 512
                 gb = val / (1000**3)
@@ -379,14 +624,64 @@ with st.sidebar:
             else:
                 st.error("请输入数字")
     
+    # === [模块 0] 资产库存管理 (新功能) ===
+    st.markdown("### 🏷️ 资产识别 & 库存")
+    
+    inv_data = load_inventory()    
+    
+    # 布局：左侧输入框，右侧库存列表
+    col_sn_input, col_sn_btn = st.columns([3, 1], gap="small")
+
+    # value 直接绑定 session_state，不需要 key 也能双向绑定，
+    input_sn = col_sn_input.text_input("序列号 (S/N)", 
+                                     value=st.session_state.hdd_sn, 
+                                     placeholder="输入或右侧选择", 
+                                     label_visibility="collapsed",
+                                     key="sn_input_widget")
+    
+    # --- 右侧：库存列表管理器 ---
+    with col_sn_btn:        
+        if st.button("📂", help="打开库存列表 (宽屏模式)", width='stretch'):
+            inventory_manager_dialog()
+
+    # --- 状态同步 ---
+    # 将输入框的值同步回 session_state (处理手动输入的情况)
+    if input_sn != st.session_state.hdd_sn:
+        st.session_state.hdd_sn = input_sn
+
+    # --- 资产信息展示与操作区 ---
+    # 获取当前 SN 在库存中的信息
+    current_sn_info = inv_data.get(st.session_state.hdd_sn, None)
+    
+    if st.session_state.hdd_sn:
+        # 场景 A: 已在库
+        if current_sn_info:
+            curr_model = current_sn_info.get('model', 'Unknown')
+            curr_memo = current_sn_info.get('memo', '')
+            st.caption(f"当前载入: {curr_memo}")
+
+            # 历史文件记录
+            history = current_sn_info.get('history', [])
+            if history:
+                with st.expander(f"📚 关联文件 ({len(history)})"):
+                    for h_file in history:
+                        st.caption(f"📄 {h_file}")
+
+        # 场景 B: 未入库 (新设备)
+        else:
+            st.info("🆕 新设备 (未登记)")
+            # 注册按钮
+            if st.button("💾 注册到库存", width='stretch'):
+                current_model = st.session_state.selected_preset
+                if current_model == "New Profile" or not current_model:
+                    st.error("请先选择有效的物理预设模型！")
+                else:
+                    register_hdd(st.session_state.hdd_sn, current_model)
+                    st.toast(f"已注册: {st.session_state.hdd_sn}")
+                    st.rerun()
+
     # [模块 2] 硬盘参数配置 
     st.markdown("### 🛠️ 物理规格")
-    
-    # 序列号输入 (绑定 session_state) 
-    st.session_state.hdd_sn = st.text_input("序列号 (S/N)", 
-                                                   value=st.session_state.hdd_sn,
-                                                   placeholder="如: WD-WCC1E1ARP1XX")   
-     
     preset_keys = list(presets.keys()) + [NEW_PROFILE]
 
     # 状态同步：如果当前 session 中的预设不在列表里，重置为第一个
@@ -404,7 +699,7 @@ with st.sidebar:
 
     # 表单区域
     # 编辑模式允许修改 Key (Model Name)；另，使用 pop 读取临时导入值，实现一次性自动填充
-    with st.expander("📝 详细参数编辑", expanded=True): # 默认非折叠
+    with st.expander("📝 详细参数编辑", expanded=False): # 默认折叠
         is_edit = st.toggle("解锁编辑", value=st.session_state.profile_edit_mode, key="edit_mode_toggle")
         st.session_state.profile_edit_mode = is_edit
 
@@ -426,7 +721,7 @@ with st.sidebar:
         c_s_in = st.number_input("内圈速度 (MB/s)", value=float(val_sin), disabled=not is_edit)
 
         if is_edit:
-            if st.button("💾 保存预设", use_container_width=True):
+            if st.button("💾 保存预设", width='stretch'):
                 if not new_model:
                     st.error("需输入型号名")
                 else:
@@ -547,7 +842,7 @@ with col_main_ui:
                         st.error(f"CSV 格式错误：缺少必要的列 {required_cols}")
                     else:
                         # 预览
-                        st.dataframe(df.head(3), hide_index=True, use_container_width=True)
+                        st.dataframe(df.head(3), hide_index=True, width='stretch')
                         
                         new_lines = []
                         for _, row in df.iterrows():
@@ -566,7 +861,7 @@ with col_main_ui:
                         col_overwrite, col_append = st.columns(2)
 
                         with col_overwrite:
-                            if st.button("🗑️ 覆盖并应用参数", type="primary", use_container_width=True):
+                            if st.button("🗑️ 覆盖并应用参数", type="primary", width='stretch'):
                                 # 更新数据
                                 st.session_state.raw_data = new_data_str
                                 
@@ -615,7 +910,7 @@ with col_main_ui:
                                 st.rerun()
                         
                         with col_append:
-                            if st.button("➕ 仅追加数据", use_container_width=True):
+                            if st.button("➕ 仅追加数据", width='stretch'):
                                 if st.session_state.raw_data.strip():
                                     st.session_state.raw_data = st.session_state.raw_data.strip() + "\n" + new_data_str
                                 else:
@@ -696,7 +991,7 @@ with col_main_ui:
                             return "\n".join(rows)
 
                         with c_imp:
-                            if st.button("⚡ 覆盖导入", type="primary", use_container_width=True):
+                            if st.button("⚡ 覆盖导入", type="primary", width='stretch'):
                                 new_data_str = read_and_parse()
                                 if new_data_str:
                                     # 格式化
@@ -725,7 +1020,7 @@ with col_main_ui:
                             help_msg = "仅当日志中的硬盘型号与当前系统预设匹配时，才允许追加数据。" if btn_disabled else "将此日志中的坏道追加到当前视图"
                             
                             if st.button("➕ 追加数据", 
-                                         use_container_width=True, 
+                                         width='stretch', 
                                          disabled=btn_disabled, 
                                          help=help_msg,
                                          key="btn_vic_append"):
@@ -740,20 +1035,20 @@ with col_main_ui:
                     st.info("路径无效，请输入包含 LOGS 的文件夹路径。")
 
     # 按钮组
-    c_btn1, c_btn2, c_btn3, c_btn4, c_btn5 = st.columns([1, 1, 1, 1, 1])
+    c_btn1, c_btn2, c_btn3, c_btn4, c_btn5 = st.columns([1, 1, 1, 1, 1], gap="small")
     with c_btn1: 
-        if st.button("🪄 Log", use_container_width=True): log_helper()
+        if st.button("🪄 Log", width='stretch'): log_helper()
 
     with c_btn2:
-        if st.button("📂 导入", use_container_width=True): import_helper()
+        if st.button("📂 导入", width='stretch'): import_helper()
 
     with c_btn3:
-        if st.button("🔢 排序", use_container_width=True, help="按 LBA 起始位置排序"):
+        if st.button("🔢 排序", width='stretch', help="按 LBA 起始位置排序"):
             st.session_state.raw_data = format_columns(st.session_state.raw_data, sort=True)
             st.rerun()
 
     with c_btn5:
-        if st.button("🚀 更新", type="primary", use_container_width=True):
+        if st.button("🚀 更新", type="primary", width='stretch'):
             st.session_state.raw_data = format_columns(st.session_state.raw_data, sort=False)
             st.rerun()
 
@@ -791,13 +1086,21 @@ with col_main_ui:
             csv_body = df.to_csv(index=False)
             final_csv_content = header_str + csv_body
             
-            st.download_button("💾 导出", 
+            if st.download_button("💾 导出", 
                                final_csv_content, 
                                filename, 
                                "text/csv", 
-                               use_container_width=True)
+                               width='stretch'):
+                register_hdd(st.session_state.hdd_sn, current_model_name, filename)
+                if not os.path.exists(HIST_DIR): os.makedirs(HIST_DIR)
+                save_path = os.path.join(HIST_DIR, filename)
+                with open(save_path, "w", encoding='utf-8') as f:
+                    f.write(final_csv_content)
+                # 更新 register_hdd 传入带路径的文件名
+                register_hdd(st.session_state.hdd_sn, current_model_name, save_path)
+
         else:
-            st.button("💾 导出", disabled=True, use_container_width=True)
+            st.button("💾 导出", disabled=True, width='stretch')
 
     # 等级过滤器：默认全选，获取 LEVELS 的所有 key
     all_levels = list(DELAY_LEVELS.keys())
