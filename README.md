@@ -1,5 +1,8 @@
 # hdd_visualizer
 
+## V5.3 配置更新
+- 配置更新： 增加了 L0 的定义用于图例显示和格式校验（不绘制到物理扫描图）
+
 ## v5.2 保存管理弹窗
 - Toast 增强: 在 pending_toasts 的处理循环中增加了 duration 参数的传递
 - 引入了 @st.dialog 弹窗 export_manager_dialog

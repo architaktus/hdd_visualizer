@@ -54,6 +54,7 @@ load_dotenv(ENV_FILE)
 
 # 等级定义/颜色映射 (Delay Level)
 DELAY_LEVELS = {
+    'L0':  {'label': 'L0 (Info)',   'color': "#17becf", 'desc': 'Log/Note (No Plot)'}, 
     'L1':  {'label': 'L1 (Gray)',   'color': "#929292", 'desc': 'Slow'}, 
     'L2':  {'label': 'L2 (Green)',  'color': '#32CD32', 'desc': 'Mid'},
     'L3':  {'label': 'L3 (Orange)', 'color': '#FFA500', 'desc': 'Warning'},
@@ -236,7 +237,7 @@ def register_hdd(sn, model, associated_file=None, memo=None):
     # 如果有关联文件，追加到历史记录
     if associated_file:
         if 'history' not in inv[sn]: inv[sn]['history'] = []
-        # [修改] 保存相对路径或文件名，防止路径泄漏或迁移失效，这里仅保存文件名
+        # 保存相对路径或文件名，防止路径泄漏或迁移失效，这里仅保存文件名
         fname = os.path.basename(associated_file)
         if fname not in inv[sn]['history']:
             inv[sn]['history'].append(fname)
@@ -331,8 +332,8 @@ def parse_victoria_content(file_content):
             
     return parsed_lines
 
-# [修改 1] 新增：统一 CSV 内容处理函数
-def process_unified_csv_content(content_string):
+# CSV 内容处理函数
+def process_csv_content(content_string):
     """
     整合 CSV 导入逻辑：
     1. 检查是否存在 Model/SN 等元数据头
@@ -649,7 +650,7 @@ def inventory_manager_dialog():
                                 with open(target_file_path, 'r', encoding='utf-8') as f:
                                     content = f.read()
                                 
-                                formatted_str, meta, success = process_unified_csv_content(content)
+                                formatted_str, meta, success = process_csv_content(content)
                                 
                                 if success:
                                     st.session_state.raw_data = formatted_str
@@ -668,29 +669,40 @@ def inventory_manager_dialog():
                     st.rerun()
 
 # 保存管理弹窗逻辑
+# TODO 覆盖保存没有提示
 @st.dialog("💾 导出与保存", width='medium')
 def export_manager_dialog(csv_content, filename, sn, model):
     st.markdown("### 选择保存方式")
     
     col1, col2 = st.columns(2, gap="medium")
     
+    save_path = os.path.join(HIST_DIR, filename)
+    file_exists = os.path.exists(save_path)
+
+    def perform_save():
+        try:
+            with open(save_path, "w", encoding='utf-8') as f:
+                f.write(csv_content)
+            
+            register_hdd(sn, model, save_path)
+            st.session_state.pending_toasts.append({'msg': f"已保存至: {filename}", 'icon': '💾', 'duration': 4000})
+            st.rerun()
+        except Exception as e:
+            st.error(f"保存失败: {e}")
+
     with col1:
         st.info("📂 **保存到默认位置 (自动)**")
         st.caption(f"路径: `{HIST_DIR}`")
-        if st.button("✅ 默认保存", type="primary", width="stretch"):
-            if not os.path.exists(HIST_DIR): os.makedirs(HIST_DIR)
-            save_path = os.path.join(HIST_DIR, filename)
-            
-            try:
-                with open(save_path, "w", encoding='utf-8') as f:
-                    f.write(csv_content)
-                
-                # 注册
-                register_hdd(sn, model, save_path)
-                st.session_state.pending_toasts.append({'msg': f"已保存至: {filename}", 'icon': '💾', 'duration': 4000})
-                st.rerun()
-            except Exception as e:
-                st.error(f"保存失败: {e}")
+
+        if file_exists:
+            st.warning(f"⚠️ 文件已存在！\n`{filename}`")
+            # 覆盖保存
+            if st.button("🚨 确认覆盖保存", type="primary", width="stretch", key="btn_overwrite"):
+                perform_save()
+        else:
+            # 正常保存
+            if st.button("✅ 默认保存", type="primary", width="stretch", key="btn_save_normal"):
+                perform_save()
 
     with col2:
         st.success("📥 **下载到本地**")
@@ -911,11 +923,10 @@ with col_main_ui:
             
             uploaded_file = st.file_uploader("选择 CSV 文件", type=["csv"])
             if uploaded_file is not None:
-                # [修改] 调用统一的 CSV 解析函数
                 content = uploaded_file.getvalue().decode("utf-8")
                 
                 # 获取解析结果
-                formatted_str, parsed_meta, success = process_unified_csv_content(content)
+                formatted_str, parsed_meta, success = process_csv_content(content)
 
                 if not success:
                     st.error(f"导入失败: {formatted_str}")
@@ -1228,7 +1239,12 @@ with col_viz:
         raw_rng = parts[0].strip()
         rng = re.sub(r'\([\d\.]+[Gg][Bb]\)', '', raw_rng) # 剔除显示用的 GB 信息
 
-        lvl = parts[1].strip().upper()        
+        lvl = parts[1].strip().upper()     
+        
+        # 等级是 L0，跳过绘图（仅作为记录）
+        if lvl == 'L0':
+            continue
+
         # 过滤：如果不在多选框中，直接跳过
         if lvl not in selected_levels:
             continue
