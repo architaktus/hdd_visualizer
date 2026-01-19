@@ -18,12 +18,12 @@ if 'pending_toasts' not in st.session_state:
 
 while st.session_state.pending_toasts:
     toast_data = st.session_state.pending_toasts.pop(0)
-    st.toast(toast_data['msg'], icon=toast_data.get('icon'))
-
-# 兼容旧代码逻辑（防止直接报错，虽然逻辑已迁移到 pending_toasts）
-if 'pending_toast' in st.session_state and st.session_state.pending_toast:
-    st.toast(st.session_state.pending_toast['msg'], duration=st.session_state.pending_toast.get('duration'))
-    st.session_state.pending_toast = None # 清空
+    dur = toast_data.get('duration') # 获取 duration，默认为 None (系统默认)
+    if dur:
+        st.toast(toast_data['msg'], icon=toast_data.get('icon')) # 某些版本不支持显示传入 duration，暂时保持标准调用或按需修改
+        # 若需强制生效且版本支持，改为: st.toast(..., duration=dur)
+    else:
+        st.toast(toast_data['msg'], icon=toast_data.get('icon'))
 
 # --- CSS 样式注入：解决 Padding 过大问题 ---
 st.markdown("""
@@ -236,8 +236,10 @@ def register_hdd(sn, model, associated_file=None, memo=None):
     # 如果有关联文件，追加到历史记录
     if associated_file:
         if 'history' not in inv[sn]: inv[sn]['history'] = []
-        if associated_file not in inv[sn]['history']:
-            inv[sn]['history'].append(associated_file)
+        # [修改] 保存相对路径或文件名，防止路径泄漏或迁移失效，这里仅保存文件名
+        fname = os.path.basename(associated_file)
+        if fname not in inv[sn]['history']:
+            inv[sn]['history'].append(fname)
 
     save_inventory(inv)
     return True
@@ -582,7 +584,7 @@ def inventory_manager_dialog():
                     if st.button("🚨 确认删除", type="primary", width='stretch'):
                         for sn in delete_sns:
                             delete_hdd(sn)
-                        st.session_state.pending_toasts.append({'msg': f"已删除 {len(delete_sns)} 条记录", 'icon': '🗑️'})
+                        st.session_state.pending_toasts.append({'msg': f"已删除 {len(delete_sns)} 条记录", 'icon': '🗑️', 'duration': 3000})
                         st.rerun() # 刷新以更新表格
                 
                 # 提示文本
@@ -636,7 +638,6 @@ def inventory_manager_dialog():
                         st.session_state.selected_preset = target_model
                         st.session_state.tmp_imported_model = target_model
                         st.session_state.edit_mode = False
-                        # [修改] 使用新的 pending_toasts
                         st.session_state.pending_toasts.append({'msg': f"参数已加载: {target_model}", 'icon': '✅'})
                     else:
                          st.session_state.pending_toasts.append({'msg': f"预设缺失: {target_model}，仅加载 SN", 'icon': '⚠️'})
@@ -652,7 +653,7 @@ def inventory_manager_dialog():
                                 
                                 if success:
                                     st.session_state.raw_data = formatted_str
-                                    st.session_state.pending_toasts.append({'msg': f"历史数据已加载: {target_file}", 'icon': '📂'}) #type: ignore
+                                    st.session_state.pending_toasts.append({'msg': f"历史数据已加载: {target_file}", 'icon': '📂', 'duration': 4000}) #type: ignore
                                 else:
                                     st.error(f"解析失败: {formatted_str}")
                                     return 
@@ -665,6 +666,56 @@ def inventory_manager_dialog():
                     
                     # 刷新主界面，关闭弹窗
                     st.rerun()
+
+# 保存管理弹窗逻辑
+@st.dialog("💾 导出与保存", width='medium')
+def export_manager_dialog(csv_content, filename, sn, model):
+    st.markdown("### 选择保存方式")
+    
+    col1, col2 = st.columns(2, gap="medium")
+    
+    with col1:
+        st.info("📂 **保存到默认位置 (自动)**")
+        st.caption(f"路径: `{HIST_DIR}`")
+        if st.button("✅ 默认保存", type="primary", width="stretch"):
+            if not os.path.exists(HIST_DIR): os.makedirs(HIST_DIR)
+            save_path = os.path.join(HIST_DIR, filename)
+            
+            try:
+                with open(save_path, "w", encoding='utf-8') as f:
+                    f.write(csv_content)
+                
+                # 注册
+                register_hdd(sn, model, save_path)
+                st.session_state.pending_toasts.append({'msg': f"已保存至: {filename}", 'icon': '💾', 'duration': 4000})
+                st.rerun()
+            except Exception as e:
+                st.error(f"保存失败: {e}")
+
+    with col2:
+        st.success("📥 **下载到本地**")
+        st.caption("使用浏览器保存")
+        st.download_button("⬇️ 点击下载 CSV", 
+                           csv_content, 
+                           filename, 
+                           "text/csv", 
+                           width='stretch')
+
+    st.divider()
+    with st.expander("🛠️ 另存为 (服务器端自定义路径)"):
+        custom_dir = st.text_input("输入服务器文件夹路径", placeholder="例如: D:/Backups/HDD_Logs")
+        if st.button("💾 保存到自定义位置"):
+            if custom_dir and os.path.isdir(custom_dir):
+                save_path = os.path.join(custom_dir, filename)
+                try:
+                    with open(save_path, "w", encoding='utf-8') as f:
+                        f.write(csv_content)
+                    st.success(f"成功保存到: {save_path}")
+                except Exception as e:
+                    st.error(f"写入失败: {e}")
+            else:
+                st.error("路径无效或不存在")
+
 
 with st.sidebar:
     st.title("⚙️ 硬盘工具箱")
@@ -736,7 +787,7 @@ with st.sidebar:
                     st.error("请先选择有效的物理预设模型！")
                 else:
                     register_hdd(st.session_state.hdd_sn, current_model)
-                    st.toast(f"已注册: {st.session_state.hdd_sn}")
+                    st.toast(f"已注册: {st.session_state.hdd_sn}", duration=3000)
                     st.rerun()
 
     # [模块 2] 硬盘参数配置 
@@ -795,7 +846,7 @@ with st.sidebar:
                     save_presets(presets)                    
                     # 保存后更新选中状态
                     st.session_state.selected_preset = new_model
-                    st.toast(f"配置 {new_model} 已保存!")
+                    st.toast(f"配置 {new_model} 已保存!", duration=3000)
                     st.rerun()
 
     # ZBR 参数计算 (供绘图用)
@@ -916,15 +967,15 @@ with col_main_ui:
                                     if is_identical:
                                         # 2.1 内容一致 -> 锁定
                                         st.session_state.profile_edit_mode = False
-                                        st.toast(f"参数与预设 '{imp_model}' 完美匹配。")
+                                        st.toast(f"参数与预设 '{imp_model}' 完美匹配。", duration=3000)
                                     else:
                                         # 2.2 内容不一致 -> 解锁并提示
                                         st.session_state.profile_edit_mode = True
-                                        st.toast(f"预设 '{imp_model}' 存在但参数不一致，已开启编辑模式。", icon="⚠️")
+                                        st.toast(f"预设 '{imp_model}' 存在但参数不一致，已开启编辑模式。", icon="⚠️", duration=4000)
                                 else:
                                     # 情况 3: 不存在 -> 指向 New Profile
                                     st.session_state.profile_edit_mode = True
-                                    st.toast(f"新检测到型号 '{imp_model}'，已切换至 New Profile。", icon="🆕")
+                                    st.toast(f"新检测到型号 '{imp_model}'，已切换至 New Profile。", icon="🆕", duration=4000)
                                 
                                 st.session_state.selected_preset = target_preset
                             st.rerun()
@@ -947,8 +998,8 @@ with col_main_ui:
             
             with col_path:
                 input_path = st.text_input("Victoria Log 文件夹路径", value=current_path, 
-                                                                 placeholder="C:/Victoria/LOGS",
-                                                                 label_visibility="collapsed")
+                                                                     placeholder="C:/Victoria/LOGS",
+                                                                     label_visibility="collapsed")
             with col_btn:
                 if st.button("💾 保存"):
                     if os.path.isdir(input_path):
@@ -1025,10 +1076,10 @@ with col_main_ui:
                                     if model in presets:
                                         target_preset = model
                                         st.session_state.edit_mode = False
-                                        st.toast(f"匹配预设: {model}")
+                                        st.toast(f"匹配预设: {model}", duration=3000)
                                     else:
                                         st.session_state.edit_mode = True
-                                        st.toast("新预设", icon="🆕")
+                                        st.toast("新预设", icon="🆕", duration=3000)
                                     
                                     st.session_state.selected_preset = target_preset
                                     st.rerun()
@@ -1071,7 +1122,6 @@ with col_main_ui:
             st.rerun()
 
     with c_btn4:
-        # CSV 导出逻辑(4列: Range, Level, Count, Memo)
         export_list = []
         lines_raw = st.session_state.raw_data.strip().split('\n')
         for line in lines_raw:
@@ -1080,42 +1130,34 @@ with col_main_ui:
             r_val = parts[0]
             l_val = parts[1] if len(parts) > 1 else ""
             c_val = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
-            m_val = parts[4] if len(parts) > 4 else ""
+            # 清理 memo 中的管道符，防止 CSV 结构错乱
+            raw_memo = parts[4] if len(parts) > 4 else ""
+            m_val = raw_memo.replace('|', '/').replace('\n', ' ')
 
             export_list.append({'range': r_val, 'level': l_val, 'count': c_val, 'memo': m_val})
             
         if export_list:
             current_model_name = new_model if 'new_model_name' in locals() else selected_model
-            current_model_name = str(current_model_name) if current_model_name else "Unknown" # Pylance guard
+            current_model_name = str(current_model_name) if current_model_name else "Unknown"
             safe_model = re.sub(r'[\\/*?:"<>|]', '_', current_model_name).strip()
             safe_sn = re.sub(r'[\\/*?:"<>|]', '_', st.session_state.hdd_sn).strip()
             if not safe_sn: safe_sn = "NoSN"
             
             filename = f"BadSectors_{safe_model}_{safe_sn}.csv"
             
-            # 文件内容
-            # Header: Model: ...; Capacity ...; SN: ...
+            # 文件内容构建
             header_str = (f"Model: {current_model_name}; SN: {st.session_state.hdd_sn}; "
                           f"LBA: {int(c_lba)}; Heads: {int(c_heads)}; RPM: {int(c_rpm)}; "
                           f"Speed: {float(c_s_out)}/{float(c_s_in)}\n")
-            # CSV Body
+            
             df = pd.DataFrame(export_list)
             df = df[['range', 'level', 'count', 'memo']]
             csv_body = df.to_csv(index=False)
             final_csv_content = header_str + csv_body
             
-            if st.download_button("💾 导出", 
-                               final_csv_content, 
-                               filename, 
-                               "text/csv", 
-                               width='stretch'):
-                register_hdd(st.session_state.hdd_sn, current_model_name, filename)
-                if not os.path.exists(HIST_DIR): os.makedirs(HIST_DIR)
-                save_path = os.path.join(HIST_DIR, filename)
-                with open(save_path, "w", encoding='utf-8') as f:
-                    f.write(final_csv_content)
-                # 更新 register_hdd 传入带路径的文件名
-                register_hdd(st.session_state.hdd_sn, current_model_name, save_path)
+            # 触发 Dialog
+            if st.button("💾 导出", width='stretch'):
+                export_manager_dialog(final_csv_content, filename, st.session_state.hdd_sn, current_model_name)
 
         else:
             st.button("💾 导出", disabled=True, width='stretch')
@@ -1201,8 +1243,9 @@ with col_viz:
         # 逻辑：单点、指定点数或小范围画散点；大范围画弧线
         if s == e or cnt > 0:
             # 散点模式
-            num = max(1, cnt)
-            for lba in np.linspace(s, e, num):
+            display_count = min(cnt, 200) if cnt > 0 else 1 
+            
+            for lba in np.linspace(s, e, display_count):
                 c, h, th, r_norm = lba_to_chs(lba, c_heads, A, B, Total_Cyls)
                 r_vis = 1.0 - r_norm * (1.0 - r_in_ratio)
                 plot_items.append({'type': 'pt', 'h': h, 'r': r_vis, 'th': th, 'c': color})

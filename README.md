@@ -1,5 +1,9 @@
 # hdd_visualizer
 
+## v5.2 保存管理弹窗
+- Toast 增强: 在 pending_toasts 的处理循环中增加了 duration 参数的传递
+- 引入了 @st.dialog 弹窗 export_manager_dialog
+- 漏洞修复:绘图逻辑修复、CSV 导出问题、数据类型安全
 
 ## v5.1 消息队列与导出逻辑整合
 **关键词：** `消息队列` `CSV解析整合` `元数据感知` `异步反馈`
