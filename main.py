@@ -10,8 +10,17 @@ from dotenv import load_dotenv, set_key
 import glob
 
 # --- 1. 配置与全局常量 ---
-st.set_page_config(page_title="HDD Physical Diagnostic V4.6", layout="wide")
+st.set_page_config(page_title="HDD Physical Diagnostic", layout="wide")
 
+# Toast 逻辑：支持多个 toast 队列
+if 'pending_toasts' not in st.session_state:
+    st.session_state.pending_toasts = []
+
+while st.session_state.pending_toasts:
+    toast_data = st.session_state.pending_toasts.pop(0)
+    st.toast(toast_data['msg'], icon=toast_data.get('icon'))
+
+# 兼容旧代码逻辑（防止直接报错，虽然逻辑已迁移到 pending_toasts）
 if 'pending_toast' in st.session_state and st.session_state.pending_toast:
     st.toast(st.session_state.pending_toast['msg'], duration=st.session_state.pending_toast.get('duration'))
     st.session_state.pending_toast = None # 清空
@@ -320,6 +329,67 @@ def parse_victoria_content(file_content):
             
     return parsed_lines
 
+# [修改 1] 新增：统一 CSV 内容处理函数
+def process_unified_csv_content(content_string):
+    """
+    整合 CSV 导入逻辑：
+    1. 检查是否存在 Model/SN 等元数据头
+    2. 提取元数据
+    3. 解析 CSV 主体并标准化格式
+    返回: (标准化数据字符串, 元数据字典, 是否成功)
+    """
+    try:
+        lines = content_string.splitlines()
+        if not lines:
+            return "", {}, False
+
+        # 解析 Header Metadata
+        header_line = lines[0]
+        meta_pattern = r"Model: (.*); SN: (.*); LBA: (\d+); Heads: (\d+); RPM: (\d+); Speed: ([\d\.]+)/([\d\.]+)"
+        match = re.search(meta_pattern, header_line)
+        
+        parsed_meta = {}
+        csv_start_line = 0
+
+        if match:
+            parsed_meta['model'] = match.group(1).strip()
+            parsed_meta['sn'] = match.group(2).strip()
+            parsed_meta['lba'] = int(match.group(3))
+            parsed_meta['heads'] = int(match.group(4))
+            parsed_meta['rpm'] = int(match.group(5))
+            parsed_meta['s_out'] = float(match.group(6))
+            parsed_meta['s_in'] = float(match.group(7))
+            csv_start_line = 1 # 跳过第一行
+        
+        # 解析数据主体
+        csv_body = "\n".join(lines[csv_start_line:])
+        df = pd.read_csv(StringIO(csv_body))
+        df = df.fillna("")
+
+        # 校验列
+        required_cols = ['range', 'level']
+        if not all(col in df.columns for col in required_cols):
+             return "Missing Columns", {}, False
+        
+        # 格式化为内部字符串格式
+        new_lines = []
+        for _, row in df.iterrows():
+            rng = str(row['range'])
+            lvl = str(row['level'])
+            cnt = row['count'] if 'count' in df.columns and pd.notna(row['count']) else 0
+            memo = str(row['memo']) if 'memo' in df.columns and pd.notna(row['memo']) else ""
+            # 兼容处理
+            if cnt == "": cnt = 0
+            
+            new_lines.append(f"{rng}|{lvl}|{int(cnt)}||{memo}")
+        
+        raw_str = "\n".join(new_lines)
+        formatted_str = format_columns(raw_str, sort=True)
+        return formatted_str, parsed_meta, True
+
+    except Exception as e:
+        return str(e), {}, False
+
 def load_presets():
     if not os.path.exists(PRESETS_FILE):
         default = {
@@ -512,7 +582,7 @@ def inventory_manager_dialog():
                     if st.button("🚨 确认删除", type="primary", width='stretch'):
                         for sn in delete_sns:
                             delete_hdd(sn)
-                        st.toast(f"已删除 {len(delete_sns)} 条记录")
+                        st.session_state.pending_toasts.append({'msg': f"已删除 {len(delete_sns)} 条记录", 'icon': '🗑️'})
                         st.rerun() # 刷新以更新表格
                 
                 # 提示文本
@@ -545,8 +615,8 @@ def inventory_manager_dialog():
                 if history_files:
                     # 默认选择最新的一个（假设列表最后是新的）
                     target_file = st.selectbox("是否同步读取历史 CSV 数据？", 
-                                            options=["不读取 (仅加载参数)"] + history_files[::-1],
-                                            index=1 if history_files else 0)
+                                                options=["不读取 (仅加载参数)"] + history_files[::-1],
+                                                index=1 if history_files else 0)
                     
                     if target_file != "不读取 (仅加载参数)":
                         load_csv_data = True
@@ -560,51 +630,40 @@ def inventory_manager_dialog():
                     # 1. 设置 SN
                     st.session_state.hdd_sn = target_sn
                     st.session_state["sn_input_widget"] = target_sn
-                    msg_list = []
                     
                     # 2. 设置 Model
                     if target_model in presets:
                         st.session_state.selected_preset = target_model
                         st.session_state.tmp_imported_model = target_model
                         st.session_state.edit_mode = False
-                        msg_list.append(f"参数: {target_model}。\r\n")
+                        # [修改] 使用新的 pending_toasts
+                        st.session_state.pending_toasts.append({'msg': f"参数已加载: {target_model}", 'icon': '✅'})
                     else:
-                        msg_list.append(f"预设缺失: {target_model}，仅加载 SN。\r\n")
+                         st.session_state.pending_toasts.append({'msg': f"预设缺失: {target_model}，仅加载 SN", 'icon': '⚠️'})
 
                     # 3. 读取 CSV (如果选择了)
                     if load_csv_data and target_file_path:
-                        # 尝试读取文件
                         if os.path.exists(target_file_path):
                             try:
-                                df_csv = pd.read_csv(target_file_path, encoding='utf-8')
-                                df_csv = df_csv.fillna("")
-
-                                if 'range' in df_csv.columns and 'level' in df_csv.columns:
-                                    new_lines = []
-                                    for _, r in df_csv.iterrows():
-                                        rng = str(r['range'])
-                                        lvl = str(r['level'])
-                                        cnt = r['count'] if 'count' in df_csv.columns else 0
-                                        memo = r['memo'] if 'memo' in df_csv.columns else ""
-                                        new_lines.append(f"{rng}|{lvl}|{cnt}||{memo}")
-                                    
-                                    # 格式化并更新
-                                    raw_str = "\n".join(new_lines)
-                                    st.session_state.raw_data = format_columns(raw_str, sort=True)
-                                    msg_list.append(f"历史数据已加载: {target_file_path}\r\n")
+                                with open(target_file_path, 'r', encoding='utf-8') as f:
+                                    content = f.read()
+                                
+                                formatted_str, meta, success = process_unified_csv_content(content)
+                                
+                                if success:
+                                    st.session_state.raw_data = formatted_str
+                                    st.session_state.pending_toasts.append({'msg': f"历史数据已加载: {target_file}", 'icon': '📂'}) #type: ignore
                                 else:
-                                    msg_list.append("CSV 格式不兼容")
+                                    st.error(f"解析失败: {formatted_str}")
+                                    return 
                             except Exception as e:
-                                #print("正在尝试显示提示 ERR! 无法读取文件")
                                 st.error(f"无法读取文件: {e}")
                                 return
                         else:
-                            print("正在尝试显示提示 ERR! 找不到文件")
-                            st.toast(f"ERR! 找不到文件: {target_file_path}", duration="long")
+                            st.toast(f"ERR! 找不到文件: {target_file_path}", icon="❌")
                             return
                     
                     # 刷新主界面，关闭弹窗
-                    st.session_state.pending_toast = {'msg': " | ".join(msg_list), 'duration': 'long'}
                     st.rerun()
 
 with st.sidebar:
@@ -801,123 +860,82 @@ with col_main_ui:
             
             uploaded_file = st.file_uploader("选择 CSV 文件", type=["csv"])
             if uploaded_file is not None:
-                try:
-                    # 1. 读取文件
-                    content = uploaded_file.getvalue().decode("utf-8").splitlines()                
-                    if not content:
-                        st.error("文件为空")
-                        return
-                    
-                    # 2. 解析第一行 Metadata
-                    header_line = content[0]
-                    # Header format: Model: ...; LBA: ...; Heads: ...; RPM: ...; SO: ...; SI: ...; SN: ...
-                    meta_pattern = r"Model: (.*); SN: (.*); LBA: (\d+); Heads: (\d+); RPM: (\d+); Speed: ([\d\.]+)/([\d\.]+)"
-                    match = re.search(meta_pattern, header_line)
-                    
-                    parsed_meta = {}
-                    csv_start_line = 0
-                    # 匹配 Model
-                    if match:
-                        parsed_meta['model'] = match.group(1).strip()
-                        parsed_meta['sn'] = match.group(2).strip()
-                        parsed_meta['lba'] = int(match.group(3))
-                        parsed_meta['heads'] = int(match.group(4))
-                        parsed_meta['rpm'] = int(match.group(5))
-                        parsed_meta['s_out'] = float(match.group(6))
-                        parsed_meta['s_in'] = float(match.group(7))
+                # [修改] 调用统一的 CSV 解析函数
+                content = uploaded_file.getvalue().decode("utf-8")
+                
+                # 获取解析结果
+                formatted_str, parsed_meta, success = process_unified_csv_content(content)
 
-                        csv_start_line = 1 # 跳过第一行
-                        st.success(f"识别到硬盘: {parsed_meta['model']} (SN: {parsed_meta['sn']})")
+                if not success:
+                    st.error(f"导入失败: {formatted_str}")
+                else:
+                    # 预览
+                    if parsed_meta:
+                        st.success(f"识别到硬盘: {parsed_meta.get('model')} (SN: {parsed_meta.get('sn')})")
                     else:
                         st.warning("未检测到标准元数据头，将作为普通 CSV 读取。")
+                    
+                    # 简易预览 (显示前几行)
+                    st.text_area("预览 (Formatted)", formatted_str[:500] + "...", height=100, disabled=True)
 
-                    # 3. 解析数据部分 (跳过第一行 Metadata)
-                    # 将剩余内容重新组合供 pandas 读取
-                    csv_body = "\n".join(content[csv_start_line:])
-                    df = pd.read_csv(StringIO(csv_body))
+                    col_overwrite, col_append = st.columns(2)
 
-                    # 校验
-                    required_cols = ['range', 'level'] # count 可选
-                    if not all(col in df.columns for col in required_cols):
-                        st.error(f"CSV 格式错误：缺少必要的列 {required_cols}")
-                    else:
-                        # 预览
-                        st.dataframe(df.head(3), hide_index=True, width='stretch')
-                        
-                        new_lines = []
-                        for _, row in df.iterrows():
-                            rng = str(row['range'])
-                            lvl = str(row['level'])
-                            # 读取 count 列，如果没有则默认为 0
-                            cnt = row['count'] if 'count' in df.columns and pd.notna(row['count']) else 0
-                            memo = str(row['memo']) if 'memo' in df.columns and pd.notna(row['memo']) else ""
+                    with col_overwrite:
+                        if st.button("🗑️ 覆盖并应用参数", type="primary", width='stretch'):
+                            # 更新数据
+                            st.session_state.raw_data = formatted_str
+                            
+                            # 如果有元数据，强制更新当前设置
+                            if parsed_meta:
+                                imp_model = parsed_meta.get('model', 'Unknown')
 
-                            # 组合 4 列，格式: range|level|count|memo
-                            new_lines.append(f"{rng}|{lvl}|{int(cnt)}||{memo}")
-
-                        new_data_str = "\n".join(new_lines)
-                        new_data_str = format_columns(new_data_str)
-
-                        col_overwrite, col_append = st.columns(2)
-
-                        with col_overwrite:
-                            if st.button("🗑️ 覆盖并应用参数", type="primary", width='stretch'):
-                                # 更新数据
-                                st.session_state.raw_data = new_data_str
+                                # 要写入侧边栏输入框的临时数据
+                                st.session_state.hdd_sn = parsed_meta.get('sn', '')
+                                st.session_state.tmp_imported_model = imp_model
+                                st.session_state.tmp_imported_lba = parsed_meta.get('lba')
+                                st.session_state.tmp_imported_heads = parsed_meta.get('heads')
+                                st.session_state.tmp_imported_rpm = parsed_meta.get('rpm')
+                                st.session_state.tmp_imported_sout = parsed_meta.get('s_out')
+                                st.session_state.tmp_imported_sin = parsed_meta.get('s_in')
                                 
-                                # 如果有元数据，强制更新当前设置
-                                if match:
-                                    imp_model = parsed_meta['model']
+                                target_preset = NEW_PROFILE
+                                # 存在同名预设
+                                if imp_model in presets:
+                                    target_preset = imp_model    
 
-                                    # 要写入侧边栏输入框的临时数据
-                                    st.session_state.hdd_sn = parsed_meta['sn']
-                                    st.session_state.tmp_imported_model = imp_model
-                                    st.session_state.tmp_imported_lba = parsed_meta['lba']
-                                    st.session_state.tmp_imported_heads = parsed_meta['heads']
-                                    st.session_state.tmp_imported_rpm = parsed_meta['rpm']
-                                    st.session_state.tmp_imported_sout = parsed_meta['s_out']
-                                    st.session_state.tmp_imported_sin = parsed_meta['s_in']
-                                    
-                                    target_preset = NEW_PROFILE
-                                    # 存在同名预设
-                                    if imp_model in presets:
-                                        target_preset = imp_model    
+                                    # 检查参数一致性
+                                    p_data = presets[imp_model]
+                                    is_identical = (
+                                        p_data['lba_max'] == parsed_meta['lba'] and
+                                        p_data['heads'] == parsed_meta['heads'] and
+                                        p_data['rpm'] == parsed_meta['rpm'] and
+                                        p_data['speed_out'] == parsed_meta['s_out'] and
+                                        p_data['speed_in'] == parsed_meta['s_in']
+                                    )
 
-                                        # 检查参数一致性
-                                        p_data = presets[imp_model]
-                                        is_identical = (
-                                            p_data['lba_max'] == parsed_meta['lba'] and
-                                            p_data['heads'] == parsed_meta['heads'] and
-                                            p_data['rpm'] == parsed_meta['rpm'] and
-                                            p_data['speed_out'] == parsed_meta['s_out'] and
-                                            p_data['speed_in'] == parsed_meta['s_in']
-                                        )
-
-                                        if is_identical:
-                                            # 2.1 内容一致 -> 锁定
-                                            st.session_state.profile_edit_mode = False
-                                            st.toast(f"参数与预设 '{imp_model}' 完美匹配。")
-                                        else:
-                                            # 2.2 内容不一致 -> 解锁并提示
-                                            st.session_state.profile_edit_mode = True
-                                            st.toast(f"预设 '{imp_model}' 存在但参数不一致，已开启编辑模式。", icon="⚠️")
+                                    if is_identical:
+                                        # 2.1 内容一致 -> 锁定
+                                        st.session_state.profile_edit_mode = False
+                                        st.toast(f"参数与预设 '{imp_model}' 完美匹配。")
                                     else:
-                                        # 情况 3: 不存在 -> 指向 New Profile
+                                        # 2.2 内容不一致 -> 解锁并提示
                                         st.session_state.profile_edit_mode = True
-                                        st.toast(f"新检测到型号 '{imp_model}'，已切换至 New Profile。", icon="🆕")
-                                    
-                                    st.session_state.selected_preset = target_preset
-                                st.rerun()
-                        
-                        with col_append:
-                            if st.button("➕ 仅追加数据", width='stretch'):
-                                if st.session_state.raw_data.strip():
-                                    st.session_state.raw_data = st.session_state.raw_data.strip() + "\n" + new_data_str
+                                        st.toast(f"预设 '{imp_model}' 存在但参数不一致，已开启编辑模式。", icon="⚠️")
                                 else:
-                                    st.session_state.raw_data = new_data_str
-                                st.rerun()
-                except Exception as e:
-                    st.error(f"读取失败: {e}")
+                                    # 情况 3: 不存在 -> 指向 New Profile
+                                    st.session_state.profile_edit_mode = True
+                                    st.toast(f"新检测到型号 '{imp_model}'，已切换至 New Profile。", icon="🆕")
+                                
+                                st.session_state.selected_preset = target_preset
+                            st.rerun()
+                    
+                    with col_append:
+                        if st.button("➕ 仅追加数据", width='stretch'):
+                            if st.session_state.raw_data.strip():
+                                st.session_state.raw_data = st.session_state.raw_data.strip() + "\n" + formatted_str
+                            else:
+                                st.session_state.raw_data = formatted_str
+                            st.rerun()
 
         # === TAB 2: Victoria Log 导入 ===
         with tab_vic:
@@ -929,8 +947,8 @@ with col_main_ui:
             
             with col_path:
                 input_path = st.text_input("Victoria Log 文件夹路径", value=current_path, 
-                                         placeholder="C:/Victoria/LOGS",
-                                         label_visibility="collapsed")
+                                                                 placeholder="C:/Victoria/LOGS",
+                                                                 label_visibility="collapsed")
             with col_btn:
                 if st.button("💾 保存"):
                     if os.path.isdir(input_path):
@@ -1014,7 +1032,7 @@ with col_main_ui:
                                     
                                     st.session_state.selected_preset = target_preset
                                     st.rerun()
-
+                        
                         with c_app:
                             btn_disabled = not is_model_known
                             help_msg = "仅当日志中的硬盘型号与当前系统预设匹配时，才允许追加数据。" if btn_disabled else "将此日志中的坏道追加到当前视图"
@@ -1024,7 +1042,7 @@ with col_main_ui:
                                          disabled=btn_disabled, 
                                          help=help_msg,
                                          key="btn_vic_append"):
-                                         
+                                    
                                 new_data_str = read_and_parse()
                                 if new_data_str:
                                     combined = (st.session_state.raw_data + "\n" + new_data_str).strip()
